@@ -91,31 +91,29 @@ You will see:
 
 ### "How does the category assignment work?"
 
-The system uses two layers:
+Every transaction is categorised by **Claude AI** — there is no fixed rule list anymore. The AI is shown, for every transaction, the full picture: date, description, transaction type, payment reference, the bank's own category hint, and whether money went in or out. It doesn't just pattern-match a payee name — it reasons about the whole transaction, which is why it can correctly tell a salary payment apart from a dividend or a director's loan repayment to the same person, just from the reference and amount.
 
-**Layer 1 — Instant rules (no internet needed):**
-Known payees are recognised immediately at zero cost. For example:
-- Any TFL payment → *Travel*
-- Any RINGGO / HERTS PARKING / PLACES FOR LONDON → *Parking*
-- Ayaoptics or Kite Eyewear income → *Income*
-- Miss B Hamid salary standing order → *Directors salary*
-- Mrs M Hamid / See Optyx standing order → *Mother Salary*
-- Royal Mail / Post Office → *Postage*
-- Barclays commission charges → *Bank charges*
-- Joe the Juice / Blank Street / Watchhouse / Bombay Street → *Lunch*
+Before categorising, the AI is given three things so it categorises *your* business the way *your* accountant does:
 
-**Layer 2 — Claude AI (for anything not recognised by the rules):**
-If a transaction doesn't match any rule, it is sent to Claude AI which picks the closest category from the fixed list. Only the description and whether it was a payment or receipt are sent — never any account numbers or personal details.
+1. **Your own workbook's history** — the categories your accountant already assigned in your existing spreadsheet rows are read and given to the AI as the strongest guide. Your own spelling and conventions always come first.
+2. **Corrections learned from past reviews** — see below.
+3. **A general accounting category list** and optician/optometry-specific domain knowledge (e.g. recognising AOP, GOC, PCSE, FODO, DBS, SIPP, and how to distinguish salary vs. dividend vs. director's loan) as a fallback for anything your own history doesn't cover.
+
+Only the description and reference text are sent to the AI, and account numbers, sort codes and IBANs are automatically stripped out first — never any full account details.
+
+---
+
+### "How does the system get smarter over time?"
+
+Every time you review an output file and correct a category (writing the right one in the column next to "UC Category"), that correction isn't just fixing that one file — it's saved. When enough corrections agree on how a particular payee should be categorised, that becomes a permanent example the AI is shown for every future statement, for every client. So a mistake only needs to be corrected once — after that, the same payee is categorised correctly automatically.
 
 ---
 
 ### "What categories does it use?"
 
-Every transaction is placed into exactly one of these categories:
+The AI prefers your own workbook's existing category names first. When nothing in your history fits, it falls back to a general accounting category list (Accountancy, Bank charges, HMRC-PAYE/VAT/CT/SA, Directors salary, DLA, Dividends, Income, Lunch, Petrol, Travel, Subscriptions, Sundry, and more) — and if genuinely nothing fits, it proposes the most sensible short category name rather than forcing a bad match.
 
-> Accountancy · Bank charges · Car Insurance · Charging · Company Car · DLA · Directors salary · Donation · Entertainment · Equipment · Gym · HMRC · In/Out · Income · Insurance · Interest income · Investment · Lunch · Mobile phone · Mother Salary · Parking · Penalty fee · Petrol · Postage · Professional · Professional fees - College · Refund · Subscription · Sundry · Taxes for mother · Taxi · Train · Travel
-
-If you ever want a category changed for a specific payee (e.g. BOOTS 1132 should be *Sundry* not *Lunch*), that is a one-line change in the code.
+If you ever want a category corrected for a specific payee, just write the right category next to it in your review file — that correction gets learned automatically (see above), no code changes needed.
 
 ---
 

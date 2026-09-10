@@ -385,7 +385,7 @@
   "example": "Card Purchase Watan Restaurant AppPay"
  },
  "PURCHASE BYBROOK INSIDE APPPAY": {
-  "category": "Equipment?",
+  "category": "Equipment",
   "seen": 1,
   "example": "Card Purchase BYBROOK INSIDE AppPay"
  },
@@ -525,7 +525,7 @@
   "example": "Card Purchase Mid Sussex District AppPay"
  },
  "PURCHASE LONDON BOROUGH LEWISHA": {
-  "category": "Parking?",
+  "category": "Parking",
   "seen": 14,
   "example": "Card Purchase London Borough Lewisha AppPay"
  },
@@ -545,7 +545,7 @@
   "example": "Card Purchase BROMLEY RINGO ECOM AppPay"
  },
  "PURCHASE PAYBYPHONE ECOM APPPAY": {
-  "category": "Parking?",
+  "category": "Parking",
   "seen": 5,
   "example": "Card Purchase PAYBYPHONE - ECOM AppPay"
  },
@@ -555,7 +555,7 @@
   "example": "Card Purchase CAFFE NERO HAYWARDS HE AppPay"
  },
  "PURCHASE SUMUP PP STREATHAM": {
-  "category": "Parking?",
+  "category": "Parking",
   "seen": 1,
   "example": "Card Purchase SumUp Pp Streatham AppPay"
  },

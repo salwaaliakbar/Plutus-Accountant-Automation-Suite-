@@ -176,7 +176,9 @@ General category list (fallback when the client vocabulary doesn't cover it):
 {cats}
 
 Domain knowledge:
-- AOP = Association of Optometrists; GOC = General Optical Council;
+- AOP = Association of Optometrists (payee often 'ASSOCIATION OF OPTOMETRISTS');
+  GOC = General Optical Council (payee often 'WWW.OPTICAL.ORG' or 'GENERAL OPTICAL COUNCIL' —
+  this is their annual registration fee, category 'GOC', not 'Professional fee');
   FODO = opticians' trade body; PCSE = Primary Care Support England (NHS income);
   DBS = Disclosure and Barring Service; SIPP = personal pension contributions
   (e.g. Hargreaves Lansdown, Vanguard, AJ Bell).
@@ -275,33 +277,48 @@ def categorise(
         _CANON.setdefault(c.lower(), c)
 
     results: list = [None] * len(transactions)
-    todo_idx, todo_txn = [], []
 
+    # Group by cache key first, so an identical transaction that appears
+    # multiple times in THIS run (e.g. the same recurring HMRC reference)
+    # is only ever asked about once — otherwise duplicates split across
+    # different Claude batches could independently get different answers,
+    # since separate API calls share no memory of each other.
+    key_to_indices: dict[tuple, list[int]] = {}
     for i, t in enumerate(transactions):
         key = _cache_key(t)
         if key in _CACHE:
             results[i] = _CACHE[key]
         else:
-            todo_idx.append(i)
-            todo_txn.append(t)
+            key_to_indices.setdefault(key, []).append(i)
+
+    unique_keys = list(key_to_indices.keys())
+    # one representative transaction per unique key
+    todo_txn = [transactions[key_to_indices[k][0]] for k in unique_keys]
 
     if todo_txn:
+        n_dupes = sum(len(v) for v in key_to_indices.values()) - len(unique_keys)
+        if n_dupes:
+            print(f"  [categorise] {len(unique_keys)} unique transactions to classify "
+                  f"({n_dupes} in-run duplicates will reuse the same answer)")
+
         api_key = os.environ.get('ANTHROPIC_API_KEY', '')
         if not api_key or api_key.startswith('sk-ant-...'):
             print(f"  [categorise] No API key — marking {len(todo_txn)} txns as 'Unknown'")
-            for i, t in zip(todo_idx, todo_txn):
-                results[i] = 'Unknown'
-                _CACHE[_cache_key(t)] = 'Unknown'
+            for k in unique_keys:
+                _CACHE[k] = 'Unknown'
+                for i in key_to_indices[k]:
+                    results[i] = 'Unknown'
         else:
             print(f"  [categorise] Model: {_MODEL}, examples: {len(example_lines)} "
                   f"({len(client_cats)} client categories)")
             for start in range(0, len(todo_txn), batch_size):
                 batch = todo_txn[start:start + batch_size]
-                batch_idx = todo_idx[start:start + batch_size]
+                batch_keys = unique_keys[start:start + batch_size]
                 print(f"  [categorise] Claude batch {start // batch_size + 1}: {len(batch)} txns...")
                 cats = _batch_classify(batch, system_prompt)
-                for i, t, cat in zip(batch_idx, batch, cats):
-                    results[i] = cat
-                    _CACHE[_cache_key(t)] = cat
+                for k, cat in zip(batch_keys, cats):
+                    _CACHE[k] = cat
+                    for i in key_to_indices[k]:
+                        results[i] = cat
 
     return results

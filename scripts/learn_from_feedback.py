@@ -79,6 +79,9 @@ def learn(folder: Path) -> dict:
                         break
                 if not corr or corr.startswith('='):   # skip formulas / junk
                     continue
+                corr = corr.rstrip('?').strip()        # '?' = accountant unsure, not a firm answer
+                if not corr:
+                    continue
                 key = _payee_key(desc)
                 if not key:
                     continue
