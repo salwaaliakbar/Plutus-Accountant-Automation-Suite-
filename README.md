@@ -17,7 +17,7 @@ Upload a Barclays bank statement (CSV, PDF or XLSX), and the system:
 |------|---------|----------|
 | Python | 3.10 or higher | https://www.python.org/downloads/ |
 | Node.js | 18 or higher | https://nodejs.org/ |
-| Anthropic API key | — | https://console.anthropic.com/ |
+| VS Code | Latest | https://code.visualstudio.com/ |
 
 ---
 
@@ -228,3 +228,17 @@ venv\Scripts\python main.py --input "statement.csv" --sheet "RAW (3)"
 **Frontend shows blank page**
 - Make sure the backend is running on port 8000 before opening the frontend
 - Check the browser console for errors (F12)
+
+**`npm install` or `npm run dev` doesn't run (blocked by PowerShell execution policy / administrator permissions)**
+
+If you see an error about running scripts being disabled on this system, PowerShell is blocking the `npm.ps1` script. In the same terminal, use `npm.cmd` instead — it bypasses the blocked `npm.ps1` file:
+
+For install:
+```
+npm.cmd install
+```
+
+To run the frontend:
+```
+npm.cmd run dev
+```
