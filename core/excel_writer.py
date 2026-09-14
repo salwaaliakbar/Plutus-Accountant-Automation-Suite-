@@ -23,7 +23,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import openpyxl
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 from core.financial_year import get_fy
 from core.year_labels import YearLabeller, learn_year_columns
@@ -66,6 +66,59 @@ def _find_last_data_row(ws, key_cols: list) -> int:
                 last = r
                 break
     return last
+
+
+# ── PivotTable sync ────────────────────────────────────────────────────────
+
+_REF_RE = re.compile(r'^([A-Z]+)(\d+):([A-Z]+)(\d+)$')
+
+
+def _relocate_pivot_clear_of_grid(ws_a, grid_last_col: int) -> None:
+    """Move any PivotTable anchored inside the Analysis sheet's own SUMIFS
+    grid columns (1..grid_last_col) out to the right of it, with a 2-column
+    gap. The grid and the pivot used to share the same cells — refreshing
+    the pivot in place made Excel treat the grid's values as "data in the
+    way" and prompt to overwrite them. Once the pivot lives in its own
+    clear columns, refresh no longer touches the grid at all. Idempotent:
+    a pivot already clear of the grid is left alone."""
+    for piv in getattr(ws_a, '_pivots', []):
+        loc = piv.location
+        m = _REF_RE.match(loc.ref or '')
+        if not m:
+            continue
+        c1, r1, c2, r2 = m.groups()
+        start_col = column_index_from_string(c1)
+        if start_col > grid_last_col:
+            continue
+        end_col = column_index_from_string(c2)
+        target_col = grid_last_col + 2
+        delta = target_col - start_col
+        loc.ref = (f'{get_column_letter(start_col + delta)}{r1}:'
+                   f'{get_column_letter(end_col + delta)}{r2}')
+
+
+def _refresh_pivot_sources(wb, new_last_row: int) -> None:
+    """Grow every embedded PivotTable's source range to cover the newly
+    appended rows and mark it to refresh on open, so a new fiscal year
+    (e.g. FY26) shows up inside the pivot automatically — no manual
+    'Refresh' click needed. Safe to call only after any pivot sharing a
+    sheet with an Analysis grid has been relocated clear of it (see
+    _relocate_pivot_clear_of_grid); otherwise Excel prompts to overwrite
+    the grid's values on every open."""
+    for sheet in wb.worksheets:
+        for piv in getattr(sheet, '_pivots', []):
+            cache = piv.cache
+            src = cache.cacheSource
+            if src is None or src.type != 'worksheet' or src.worksheetSource is None:
+                continue
+            wsrc = src.worksheetSource
+            m = _REF_RE.match(wsrc.ref or '')
+            if not m:
+                continue
+            col1, row1, col2, row2 = m.groups()
+            end_row = max(int(row2), new_last_row)
+            wsrc.ref = f'{col1}{row1}:{col2}{end_row}'
+            cache.refreshOnLoad = True
 
 
 # ── Date handling ─────────────────────────────────────────────────────────────
@@ -360,11 +413,21 @@ def write_workbook(
     net_source_col = net_col or amt_col
 
     if analysis_name and pivot_year_col and net_source_col and uc_col:
-        _update_analysis(wb[analysis_name], ws, pivot_year_col, net_source_col,
+        ws_a = wb[analysis_name]
+        _update_analysis(ws_a, ws, pivot_year_col, net_source_col,
                          uc_col, last_data_row=new_last)
         print(f"  [excel_writer] Updated {analysis_name} in place.")
+
+        grid_last_col = 1
+        c = 2
+        while ws_a.cell(4, c).value not in (None, ''):
+            grid_last_col = c
+            c += 1
+        _relocate_pivot_clear_of_grid(ws_a, grid_last_col)
     elif analysis_name:
         print("  [excel_writer] Missing year/net/category columns — Analysis left untouched.")
+
+    _refresh_pivot_sources(wb, new_last)
 
     wb.save(output_path)
     print(f"  [excel_writer] Saved -> {output_path}")
@@ -378,18 +441,25 @@ def _update_analysis(ws_a, raw_ws, year_col, net_col, uc_col, last_data_row) -> 
     net_letter  = get_column_letter(net_col)
     uc_letter   = get_column_letter(uc_col)
 
-    years_seen, cats = {}, []
+    cats = []
     for r in range(2, last_data_row + 1):
-        y = raw_ws.cell(r, year_col).value
         c = raw_ws.cell(r, uc_col).value
-        if y is not None and str(y).strip() and not str(y).startswith('='):
-            years_seen.setdefault(str(y).strip(), y)   # keep original type (str/int)
         if c is not None and str(c).strip() and not str(c).startswith('='):
             cs = str(c).strip()
             if cs not in cats:
                 cats.append(cs)
-    years = [years_seen[k] for k in sorted(years_seen)]
     cats.sort(key=str.lower)
+
+    # Year columns are frozen to whatever this sheet already has. A new
+    # fiscal year (e.g. FY26) never grows a new column here — it only shows
+    # up inside the workbook's PivotTable, which is kept in sync separately
+    # (see _refresh_pivot_sources) by expanding its source range so it picks
+    # up new years itself when Excel refreshes it.
+    years = []
+    for c in range(2, ws_a.max_column + 1):
+        v = ws_a.cell(4, c).value
+        if v is not None and str(v).strip():
+            years.append(v)
 
     old_max_row = ws_a.max_row
     old_max_col = ws_a.max_column
