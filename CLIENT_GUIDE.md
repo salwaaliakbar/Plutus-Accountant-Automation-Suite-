@@ -171,21 +171,24 @@ output/
 
 ### Quick reference — running the system
 
-Open two command prompt windows:
+To open a terminal: open the project folder in File Explorer, click once in the address bar at the top, type `cmd`, press Enter.
 
-**Window 1:**
+**Window 1 — project folder:**
 ```
-cd "Plutus Accountant Automation Suite"
 venv\Scripts\uvicorn api.server:app --host 127.0.0.1 --port 8000
 ```
 
-**Window 2:**
+**Window 2 — project folder:**
 ```
-cd "Plutus Accountant Automation Suite\frontend"
+cd frontend
 npm run dev
 ```
 
+Red error message in Window 2? Paste this instead: `npm.cmd run dev`
+
 Then go to **http://localhost:5173** in your browser.
+
+See the main `README.md` for full setup steps.
 
 ---
 

@@ -21,36 +21,56 @@ Upload a Barclays bank statement (CSV, PDF or XLSX), and the system:
 
 ---
 
+## Step 0 — Open a terminal in the project folder
+
+1. Open File Explorer and go into the project folder (the one with `main.py` and `frontend` inside — if you see another folder with almost the same name, open that one first).
+2. Click once inside the address bar at the top of the window (where the folder path is written).
+3. Type `cmd` and press Enter.
+
+A black window opens — this is your terminal. Do this every time a step below says "open a terminal".
+
+---
+
 ## Setup (one-time)
 
-### 1. Create the virtual environment and install Python packages
+### 1. Install Python packages
+
+Open a terminal (Step 0). Paste this and press Enter:
 
 ```
-cd "Plutus Accountant Automation Suite"
 python -m venv venv
 venv\Scripts\pip install -r requirements.txt
 ```
 
 ### 2. Add your Anthropic API key
 
-Copy `.env.example` to `.env` and fill in your key:
+Paste this and press Enter:
 
 ```
 copy .env.example .env
 ```
 
-Open `.env` and replace the placeholder:
+Open the new `.env` file, and replace the text with your real key:
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...your-real-key-here...
 ```
 
-### 3. Install frontend dependencies
+### 3. Install frontend files
+
+Open a terminal (Step 0). Paste this and press Enter:
 
 ```
 cd frontend
 npm install
-cd ..
+```
+
+Did it finish with no red text? Go to the next section.
+
+Did you get a **red error message**? Paste this instead:
+
+```
+npm.cmd install
 ```
 
 ---
@@ -59,19 +79,27 @@ cd ..
 
 You need **two terminals open at the same time**.
 
-**Terminal 1 — Backend API (port 8000)**
+**Terminal 1 — Backend**
+
+Open a terminal (Step 0). Paste this and press Enter:
 ```
-cd "Plutus Accountant Automation Suite"
 venv\Scripts\uvicorn api.server:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-**Terminal 2 — Frontend (port 5173)**
+**Terminal 2 — Frontend**
+
+Open another terminal (Step 0). Paste this and press Enter:
 ```
-cd "Plutus Accountant Automation Suite\frontend"
+cd frontend
 npm run dev
 ```
 
-Then open your browser at: **http://localhost:5173**
+Did you get a **red error message**? Paste this instead:
+```
+npm.cmd run dev
+```
+
+Then open your browser and go to: **http://localhost:5173**
 
 ---
 
@@ -229,16 +257,10 @@ venv\Scripts\python main.py --input "statement.csv" --sheet "RAW (3)"
 - Make sure the backend is running on port 8000 before opening the frontend
 - Check the browser console for errors (F12)
 
-**`npm install` or `npm run dev` doesn't run (blocked by PowerShell execution policy / administrator permissions)**
+**`npm install` or `npm run dev` shows a red error about "running scripts is disabled" / execution policy**
 
-If you see an error about running scripts being disabled on this system, PowerShell is blocking the `npm.ps1` script. In the same terminal, use `npm.cmd` instead — it bypasses the blocked `npm.ps1` file:
+Switch to Command Prompt and use `npm.cmd` instead of `npm` — see Setup step 3 and the Running section above for the exact steps.
 
-For install:
-```
-npm.cmd install
-```
+**Can't find `main.py` / `frontend` / the right folder to run commands in**
 
-To run the frontend:
-```
-npm.cmd run dev
-```
+See Step 0 above — GitHub downloads sometimes create a folder inside another folder of the same name.
