@@ -7,36 +7,16 @@ Auto-detects column layout from headers. Handles:
   - Comma-formatted numbers  (1,000.00)
   - Newest-first ordering — always returns ascending
   - Multiple encodings  (utf-8-sig, utf-8, latin-1, cp1252)
+
+Column detection and row parsing are shared with parse_xls.py (see
+parsers/_common.py) so that a CSV and an XLSX export of the same statement
+produce identical output.
 """
 
 import csv
-import re
-from datetime import datetime
 from pathlib import Path
 
-
-def _clean(raw: str) -> str:
-    return re.sub(r'\s{2,}', ' ', raw.replace('\t', ' ')).strip()
-
-
-def _parse_amount(raw: str):
-    if not raw or not raw.strip():
-        return None
-    cleaned = re.sub(r'[£,\s]', '', raw.strip())
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
-def _parse_datetime(raw: str):
-    """Return a datetime (keeps the time when present)."""
-    for fmt in ('%d/%m/%Y %H:%M', '%d/%m/%Y', '%m/%d/%Y'):
-        try:
-            return datetime.strptime(raw.strip(), fmt)
-        except ValueError:
-            continue
-    return None
+from parsers._common import parse_rows
 
 
 def _open_csv(path: Path):
@@ -52,15 +32,6 @@ def _open_csv(path: Path):
             except Exception:
                 pass
     raise ValueError(f"Cannot decode {path.name} — tried utf-8-sig, utf-8, latin-1, cp1252")
-
-
-def _find(headers: list, *candidates: str):
-    norm = {h.strip().lower(): h for h in headers}
-    for c in candidates:
-        found = norm.get(c.lower())
-        if found is not None:
-            return found
-    return None
 
 
 def parse_csv(path) -> list[dict]:
@@ -80,90 +51,4 @@ def parse_csv(path) -> list[dict]:
     headers = [h.strip() for h in raw_headers]
     rows = [{k.strip(): v for k, v in row.items()} for row in rows]
 
-    # ── Column detection ──────────────────────────────────────────────────────
-    date_col = _find(headers, 'Date', 'Transaction Date', 'Value Date')
-    if not date_col:
-        raise ValueError(f"No Date column found in {path.name}. Headers: {headers}")
-
-    desc_col = _find(headers,
-        'Memo', 'Counter Party', 'Description', 'Transaction description',
-        'Details', 'Narrative', 'Payee', 'From',
-    )
-    ref_col      = _find(headers, 'Reference', 'Ref', 'Transaction ID')
-    type_col     = _find(headers, 'Type', 'Transaction Type', 'Transaction type')
-    csv_cat_col  = _find(headers, 'Spending Category', 'Category name', 'Category')
-    bal_col      = _find(headers, 'Balance', 'Balance (GBP)', 'Balance (£)', 'Running Balance')
-
-    # Separate in/out takes priority over signed Amount
-    in_col  = _find(headers, 'Paid in', 'Paid In', 'IN', 'In', 'In (£)', 'In (GBP)', 'Credit')
-    out_col = _find(headers, 'Paid out', 'Paid Out', 'OUT', 'Out', 'Out (£)', 'Out (GBP)', 'Debit')
-    amt_col = _find(headers, 'Amount', 'Amount (GBP)', 'Amount (£)')
-
-    # Optional pass-through columns (some banks export these; some templates
-    # have matching columns — e.g. Shaifa's Timestamp/From/To/Status/Tag 1)
-    from_col   = _find(headers, 'From')
-    to_col     = _find(headers, 'To')
-    status_col = _find(headers, 'Status')
-    tag_col    = _find(headers, 'Tag 1', 'Tag')
-
-    transactions = []
-
-    for row in rows:
-        date_raw = row.get(date_col, '').strip()
-        if not date_raw:
-            continue
-        dt = _parse_datetime(date_raw)
-        if dt is None:
-            continue
-        d = dt.date()
-        timestamp = dt if (dt.hour or dt.minute or dt.second) else None
-
-        description  = _clean(row.get(desc_col, ''))    if desc_col    else ''
-        reference    = row.get(ref_col, '').strip()      if ref_col     else ''
-        subcategory  = row.get(type_col, '').strip()     if type_col    else ''
-        csv_category = row.get(csv_cat_col, '').strip()  if csv_cat_col else ''
-
-        # Strip leading apostrophe Excel inserts for text-prefix formatting
-        reference = reference.lstrip("'")
-
-        money_in  = 0.0
-        money_out = 0.0
-
-        if in_col or out_col:
-            money_in  = _parse_amount(row.get(in_col,  '') if in_col  else '') or 0.0
-            money_out = _parse_amount(row.get(out_col, '') if out_col else '') or 0.0
-        elif amt_col:
-            amt = _parse_amount(row.get(amt_col, ''))
-            if amt is None:
-                continue
-            if amt >= 0:
-                money_in = amt
-            else:
-                money_out = abs(amt)
-        else:
-            continue  # no usable money column
-
-        if money_in == 0 and money_out == 0:
-            continue  # blank / header row
-
-        balance = _parse_amount(row.get(bal_col, '')) if bal_col else None
-
-        transactions.append({
-            'date':         d,
-            'timestamp':    timestamp,
-            'description':  description,
-            'subcategory':  subcategory,
-            'reference':    reference,
-            'csv_category': csv_category,
-            'money_in':     money_in,
-            'money_out':    money_out,
-            'balance':      balance,
-            'from':         row.get(from_col, '').strip()   if from_col   else '',
-            'to':           row.get(to_col, '').strip()     if to_col     else '',
-            'status':       row.get(status_col, '').strip() if status_col else '',
-            'tag':          row.get(tag_col, '').strip()    if tag_col    else '',
-        })
-
-    # Sort ascending by date (some bank exports are newest-first)
-    transactions.sort(key=lambda t: t['date'])
-    return transactions
+    return parse_rows(rows, headers)
