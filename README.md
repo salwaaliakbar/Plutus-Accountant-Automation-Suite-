@@ -18,6 +18,96 @@ Upload a Barclays bank statement (CSV, PDF or XLSX), and the system:
 | Python | 3.10 or higher | https://www.python.org/downloads/ |
 | Node.js | 18 or higher | https://nodejs.org/ |
 | VS Code | Latest | https://code.visualstudio.com/ |
+| Git | Latest | https://git-scm.com/download/win |
+
+> **Installing Git:** open the Git link above, download the Windows installer, open it, and keep clicking **Next** until it says **Finish**. You do not need to change any settings.
+
+---
+
+## Which one are you? (read this first)
+
+| Your situation | What to do |
+|----------------|------------|
+| **I have never installed this project before** | Go to **"First time: get the project"** just below, then do **Setup (one-time)**. |
+| **I already installed this project before** and just want the newest version | Skip Setup. Go straight to **"Already installed before? Get the latest update"**. |
+
+---
+
+## First time: get the project
+
+You only do this **once**, the very first time.
+
+1. Open **File Explorer** and click **Desktop** on the left side.
+2. Click once inside the **address bar** at the top of the window (where the folder path is written).
+3. Type `cmd` and press **Enter**. A black window opens.
+4. Paste this and press **Enter**:
+
+```
+git clone https://github.com/salwaaliakbar/Plutus-Accountant-Automation-Suite-.git
+```
+
+5. Wait until it stops writing text. A new folder called **Plutus-Accountant-Automation-Suite-** is now on your Desktop. This is your project folder.
+6. Close the black window and continue with **Step 0** and then **Setup (one-time)** below.
+
+> **Important:** from now on, always use **this same folder**. Do not download the project again as a ZIP — if you do, the update command below will not work.
+
+---
+
+## Already installed before? Get the latest update
+
+Did you already install and use this project before? Then you **do not** need to install everything again. Just do these steps every time you are told there is a new update.
+
+**1. Close the project if it is running**
+
+If the two black windows (backend and frontend) are open, close both of them.
+
+**2. Open a terminal in the SAME project folder you used before**
+
+Follow **Step 0** below, and make sure you open the **same folder** you installed last time (the one with `main.py` and `frontend` inside).
+
+**3. Download the latest code**
+
+Paste this and press **Enter**:
+
+```
+git pull
+```
+
+Wait until it stops writing text. You will see one of these:
+
+- A list of file names, or the words **"Fast-forward"** → the update was downloaded. Go to step 4.
+- **"Already up to date."** → you already have the newest version. Go to step 4 anyway.
+
+**4. Update the packages (in case new ones were added)**
+
+In the same black window, paste this and press **Enter**:
+
+```
+venv\Scripts\pip install -r requirements.txt
+```
+
+Then paste this and press **Enter**:
+
+```
+cd frontend
+npm install
+```
+
+(If you get a red error message here, paste `npm.cmd install` instead.)
+
+**5. Start the project as normal**
+
+Close the black window and follow the **Running the project** section below.
+
+> **Don't worry:** `git pull` does **not** delete your API key (`.env` file), your output Excel files, or your bank statements. Only the program code is updated.
+
+**If `git pull` shows an error:**
+
+| Message you see | What it means | What to do |
+|-----------------|---------------|------------|
+| `'git' is not recognized...` | Git is not installed | Install Git (see **Prerequisites** at the top), close the black window, open a new one, and try again. |
+| `not a git repository` | You are in the wrong folder, **or** you downloaded the project as a ZIP last time | First check you opened the right folder (Step 0). If you did download a ZIP, do **"First time: get the project"** once to get a fresh copy, then do **Setup (one-time)** in the new folder, and copy your `.env` file from the old folder into the new folder. |
+| `Your local changes ... would be overwritten` | A project file was changed on your computer | Paste `git stash` and press **Enter**, then paste `git pull` again. |
 
 ---
 
@@ -32,6 +122,8 @@ A black window opens — this is your terminal. Do this every time a step below 
 ---
 
 ## Setup (one-time)
+
+> Already installed this project before? **Skip this whole section** and use **"Already installed before? Get the latest update"** above.
 
 ### 1. Install Python packages
 
