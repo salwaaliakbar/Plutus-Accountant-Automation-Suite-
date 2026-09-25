@@ -26,6 +26,7 @@ import openpyxl
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 from core.financial_year import get_fy
+from parsers._common import norm_header
 from core.year_labels import YearLabeller, learn_year_columns
 
 
@@ -46,19 +47,32 @@ def _detect_sheet(wb: openpyxl.Workbook, keyword: str) -> str:
 
 def _read_headers(ws) -> dict:
     row1 = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
-    return {str(v).strip().lower(): i + 1 for i, v in enumerate(row1) if v is not None}
+    hdrs = {}
+    for i, v in enumerate(row1):
+        if v is not None and str(v).strip():
+            hdrs.setdefault(norm_header(v), i + 1)
+    return hdrs
+
+
+# Template column names, matched ignoring case / spacing / '(£)' / '(GBP)'.
+DESC_COLS = ('Counter Party', 'Counterparty', 'Description', 'Transaction description',
+             'Transaction Details', 'Details', 'Memo', 'Narrative', 'Particulars',
+             'Payee', 'Name', 'Merchant')
+IN_COLS   = ('Paid in', 'Money in', 'In', 'Credit', 'Credits', 'Receipts', 'Deposits')
+OUT_COLS  = ('Paid out', 'Money out', 'Out', 'Debit', 'Debits', 'Payments',
+             'Withdrawals', 'Withdrawn')
 
 
 def _col(hdrs: dict, *names: str):
     for n in names:
-        idx = hdrs.get(n.lower())
+        idx = hdrs.get(norm_header(n))
         if idx is not None:
             return idx
     return None
 
 
 def _find_last_data_row(ws, key_cols: list) -> int:
-    """Last row where any key column (date/description/no) has a value."""
+    """Last row where any key column has a value."""
     last = 1
     for r in range(2, ws.max_row + 1):
         for c in key_cols:
@@ -75,12 +89,18 @@ _REF_RE = re.compile(r'^([A-Z]+)(\d+):([A-Z]+)(\d+)$')
 
 def _relocate_pivot_clear_of_grid(ws_a, grid_last_col: int) -> None:
     """Move any PivotTable anchored inside the Analysis sheet's own SUMIFS
-    grid columns (1..grid_last_col) out to the right of it, with a 2-column
-    gap. The grid and the pivot used to share the same cells — refreshing
-    the pivot in place made Excel treat the grid's values as "data in the
-    way" and prompt to overwrite them. Once the pivot lives in its own
-    clear columns, refresh no longer touches the grid at all. Idempotent:
-    a pivot already clear of the grid is left alone."""
+    grid (columns 1..grid_last_col) out to empty columns on its right. The
+    grid and the pivot used to share the same cells — refreshing the pivot
+    in place made Excel treat the grid's values as "data in the way" and
+    prompt to overwrite them. The target columns must be empty over the
+    pivot's rows (plus room to grow for new years/categories), so the pivot
+    never lands on the accountant's own workings either. Idempotent: a
+    pivot already clear of the grid is left alone."""
+    occupied = {}
+    for row in ws_a.iter_rows():
+        for cell in row:
+            if cell.value not in (None, ''):
+                occupied.setdefault(cell.column, []).append(cell.row)
     for piv in getattr(ws_a, '_pivots', []):
         loc = piv.location
         m = _REF_RE.match(loc.ref or '')
@@ -88,11 +108,20 @@ def _relocate_pivot_clear_of_grid(ws_a, grid_last_col: int) -> None:
             continue
         c1, r1, c2, r2 = m.groups()
         start_col = column_index_from_string(c1)
-        if start_col > grid_last_col:
+        if start_col > grid_last_col + 1:
             continue
         end_col = column_index_from_string(c2)
-        target_col = grid_last_col + 2
-        delta = target_col - start_col
+        width = end_col - start_col + 1
+        top, bottom = int(r1), int(r2) + 20          # room to grow downwards
+
+        def free(c):
+            return not any(top <= r <= bottom for r in occupied.get(c, []))
+
+        target = grid_last_col + 2
+        # need width + 2 spare columns (growth to the right) plus a gap column
+        while not all(free(c) for c in range(target - 1, target + width + 2)):
+            target += 1
+        delta = target - start_col
         loc.ref = (f'{get_column_letter(start_col + delta)}{r1}:'
                    f'{get_column_letter(end_col + delta)}{r2}')
 
@@ -174,8 +203,7 @@ def extract_client_examples(template_path, sheet_name: str = None) -> list:
     ws = wb[raw_name]
     hdrs = _read_headers(ws)
 
-    desc_col = _col(hdrs, 'Counter Party', 'Description', 'Transaction description',
-                    'Details', 'Memo', 'Narrative')
+    desc_col = _col(hdrs, *DESC_COLS)
     uc_col   = _col(hdrs, 'UC category', 'UC Category')
     ref_col  = _col(hdrs, 'Reference', 'Ref')
     type_col = _col(hdrs, 'Type', 'Transaction Type', 'Transaction type')
@@ -244,14 +272,13 @@ def write_workbook(
     acc_col   = _col(hdrs, 'ACC', 'AC')
     fy_col    = _col(hdrs, 'FY')
     date_col  = _col(hdrs, 'Date')
-    desc_col  = _col(hdrs, 'Counter Party', 'Description', 'Transaction description',
-                     'Details', 'Memo', 'Narrative')
+    desc_col  = _col(hdrs, *DESC_COLS)
     ref_col   = _col(hdrs, 'Reference', 'Ref')
     type_col  = _col(hdrs, 'Type', 'Transaction Type', 'Transaction type')
-    in_col    = _col(hdrs, 'Paid in', 'Paid In', 'IN', 'In', 'In (£)', 'In (GBP)')
-    out_col   = _col(hdrs, 'Paid out', 'Paid Out', 'OUT', 'Out', 'Out (£)', 'Out (GBP)')
-    amt_col   = _col(hdrs, 'Amount (GBP)', 'Amount (£)', 'Amount')
-    bal_col   = _col(hdrs, 'Balance', 'Balance (GBP)', 'Balance (£)')
+    in_col    = _col(hdrs, *IN_COLS)
+    out_col   = _col(hdrs, *OUT_COLS)
+    amt_col   = _col(hdrs, 'Amount', 'Value')
+    bal_col   = _col(hdrs, 'Balance', 'Running Balance')
     net_col   = _col(hdrs, 'NET', 'Net')
     buc_col   = _col(hdrs, 'Balance UC')
     chk_col   = _col(hdrs, 'Check UC', 'Check')
@@ -263,7 +290,24 @@ def write_workbook(
     status_col = _col(hdrs, 'Status')
     tag_col    = _col(hdrs, 'Tag 1', 'Tag')
 
-    last_row = _find_last_data_row(ws, [date_col, desc_col, no_col])
+    # Say loudly when the template can't hold key transaction data — the
+    # rows would otherwise go out with those fields silently missing.
+    missing = [label for label, ok in (
+        ('Date', date_col), ('Description', desc_col),
+        ('Paid in / Paid out or Amount', (in_col and out_col) or amt_col),
+    ) if not ok]
+    if missing:
+        print(f"  [excel_writer] WARNING: template sheet '{ws.title}' has no "
+              f"{', '.join(missing)} column — headers are: {list(hdrs)}")
+
+    # A real transaction row has a date or description. Some templates carry
+    # hundreds of pre-numbered empty rows (only 'No' filled): counting those
+    # as data made new rows land below them — leaving a '(blank)' year in the
+    # pivot — and made the empty row the style/formula model, so formulas
+    # such as NET were never copied onto the new rows.
+    content_cols = [c for c in (date_col, desc_col) if c] or [no_col]
+    last_row = _find_last_data_row(ws, content_cols)
+    numbered_last = _find_last_data_row(ws, [no_col]) if no_col else last_row
 
     # ── Learn this client's year-label conventions from their own rows ───────
     labellers = learn_year_columns(
@@ -303,6 +347,19 @@ def write_workbook(
         in_col in model_formulas and out_col in model_formulas
         and amt_col is not None
     )
+
+    # Paid-out sign convention: some templates (e.g. Monzo layouts) keep
+    # money out as a NEGATIVE number with NET = in + out; others keep it
+    # positive with NET = in - out. Follow whatever the client's rows do.
+    out_negative = False
+    if out_col and out_col not in model_formulas:
+        neg = pos = 0
+        for r_scan in range(2, last_row + 1):
+            v = ws.cell(r_scan, out_col).value
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v:
+                neg += v < 0
+                pos += v > 0
+        out_negative = neg > pos
 
     # ── Highest existing sequence number ──────────────────────────────────────
     last_no = 0
@@ -362,7 +419,7 @@ def write_workbook(
         w(ref_col,  (txn.get('reference') or '').strip() or None)
         w(type_col, (txn.get('subcategory') or '').strip() or None)
         w(in_col,   money_in  if money_in  > 0 else None)
-        w(out_col,  money_out if money_out > 0 else None)
+        w(out_col,  (-money_out if out_negative else money_out) if money_out > 0 else None)
         w(bal_col,  balance)
         w(csv_cat_col, (txn.get('csv_category') or '').strip() or None)
         w(uc_col,   cat)
@@ -390,7 +447,8 @@ def write_workbook(
         # 4. fallback formulas when the template rows carry static values
         if net_col and net_col not in model_formulas and in_col and out_col:
             in_l, out_l = get_column_letter(in_col), get_column_letter(out_col)
-            ws.cell(r, net_col, value=f'={in_l}{r}-{out_l}{r}')
+            op = '+' if out_negative else '-'
+            ws.cell(r, net_col, value=f'={in_l}{r}{op}{out_l}{r}')
         if buc_col and buc_col not in model_formulas and net_col:
             buc_l, net_l = get_column_letter(buc_col), get_column_letter(net_col)
             if r - 1 >= 2:
@@ -402,6 +460,13 @@ def write_workbook(
             ws.cell(r, chk_col, value=f'={bal_l}{r}-{buc_l}{r}')
 
     new_last = last_row + len(transactions)
+
+    # Pre-numbered empty rows left over below the new data would show up as
+    # a '(blank)' year in the pivot and carry duplicate numbers — clear them.
+    if no_col:
+        for r in range(new_last + 1, numbered_last + 1):
+            if all(ws.cell(r, c).value in (None, '') for c in range(1, max_col + 1) if c != no_col):
+                ws.cell(r, no_col).value = None
 
     # ── Update Analysis sheet in place ────────────────────────────────────────
     try:
@@ -441,37 +506,94 @@ def _update_analysis(ws_a, raw_ws, year_col, net_col, uc_col, last_data_row) -> 
     net_letter  = get_column_letter(net_col)
     uc_letter   = get_column_letter(uc_col)
 
-    cats = []
+    data_cats = []
     for r in range(2, last_data_row + 1):
         c = raw_ws.cell(r, uc_col).value
         if c is not None and str(c).strip() and not str(c).startswith('='):
             cs = str(c).strip()
-            if cs not in cats:
-                cats.append(cs)
-    cats.sort(key=str.lower)
+            if cs not in data_cats:
+                data_cats.append(cs)
 
-    # Year columns are frozen to whatever this sheet already has. A new
-    # fiscal year (e.g. FY26) never grows a new column here — it only shows
-    # up inside the workbook's PivotTable, which is kept in sync separately
-    # (see _refresh_pivot_sources) by expanding its source range so it picks
-    # up new years itself when Excel refreshes it.
-    years = []
+    # Year columns: the RAW year column's own labels. Row-4 cells only count
+    # if they really are such labels — some templates keep the accountant's
+    # side workings in that row (e.g. 50, 'PL', 'Grand Total', 45078), and
+    # treating those as years gave a grid of SUMIFS that match nothing.
+    # Existing year headers keep their order; years that appear in the data
+    # but not yet on the sheet (e.g. FY26 after appending a new year) are
+    # added as new columns, so the new year's totals actually show up.
+    data_years = []
+    for r in range(2, last_data_row + 1):
+        v = raw_ws.cell(r, year_col).value
+        if v not in (None, '') and not str(v).startswith('=') and v not in data_years:
+            data_years.append(v)
+    known = {str(y).strip() for y in data_years}
+
+    old_year_cols = []          # (col, value) of existing year headers
     for c in range(2, ws_a.max_column + 1):
         v = ws_a.cell(4, c).value
-        if v is not None and str(v).strip():
+        if v is not None and str(v).strip() in known:
+            old_year_cols.append((c, v))
+    years = []
+    for _, v in old_year_cols:
+        if str(v).strip() not in {str(y).strip() for y in years}:
             years.append(v)
+    have = {str(y).strip() for y in years}
+    added = sorted((y for y in data_years if str(y).strip() not in have), key=str)
 
-    old_max_row = ws_a.max_row
-    old_max_col = ws_a.max_column
+    # The old grid's extent — only this area is cleared, so anything else
+    # the accountant keeps on the sheet (notes, side calculations) survives.
+    # It spans the year headers plus any column still holding this tool's
+    # own SUMIFS from an earlier run, down to the old 'Grand Total' row.
+    grid_cols = max([c for c, _ in old_year_cols] + [1])
+    sig = f"=SUMIFS('{raw_name}'!"
+    for c in range(2, ws_a.max_column + 1):
+        if str(ws_a.cell(5, c).value or '').startswith(sig):
+            grid_cols = max(grid_cols, c)
+    if (str(ws_a.cell(4, grid_cols + 1).value or '').strip().lower() == 'grand total'):
+        grid_cols += 1          # a pivot-style 'Grand Total' column
+    grid_bottom = 4
+    for r in range(5, ws_a.max_row + 1):
+        v = ws_a.cell(r, 1).value
+        if v in (None, ''):
+            break
+        grid_bottom = r
+        if str(v).strip().lower() == 'grand total':
+            break
+
+    # Categories keep the rows they already have — accountants tag them in
+    # the next column (e.g. 'PL' / 'BS' feeding their own SUMIFs), and
+    # re-sorting would leave every tag against the wrong category. New
+    # categories go at the bottom.
+    old_cats = []
+    for r in range(5, grid_bottom + 1):
+        v = ws_a.cell(r, 1).value
+        if v not in (None, '') and str(v).strip().lower() != 'grand total':
+            old_cats.append(str(v).strip())
+    cats = old_cats + sorted((c for c in data_cats if c not in old_cats), key=str.lower)         if old_cats else sorted(data_cats, key=str.lower)
+
+    # A new year (e.g. FY26) becomes a grid column only if those columns are
+    # free. If the accountant uses them, the new year is left to the
+    # PivotTable, which picks it up on refresh (see _refresh_pivot_sources).
+    if added:
+        first_new_col = 2 + len(years)
+        need = range(first_new_col, first_new_col + len(added))
+        busy = [f"{get_column_letter(c)}{r}" for c in need if c > grid_cols
+                for r in range(3, 6 + len(cats)) if ws_a.cell(r, c).value not in (None, '')]
+        if busy:
+            print(f"  [excel_writer] Analysis: year(s) {added} not added as grid columns — "
+                  f"cells {busy[:3]} are in use; they appear in the PivotTable instead.")
+        else:
+            years += added
+            print(f"  [excel_writer] Analysis: added year column(s) {added}")
 
     # style models taken from the existing populated area
     hdr_style = copy(ws_a.cell(4, 2)._style)
     cat_style = copy(ws_a.cell(5, 1)._style)
     val_style = copy(ws_a.cell(5, 2)._style)
 
-    # clear old values but keep every cell's formatting
-    for r in range(1, old_max_row + 1):
-        for c in range(1, old_max_col + 1):
+    # clear the old grid's values but keep every cell's formatting
+    for r in range(3, grid_bottom + 1):
+        for c in range(1, grid_cols + 1):
             ws_a.cell(r, c).value = None
 
     ws_a.cell(3, 1, 'Sum of NET')

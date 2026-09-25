@@ -26,6 +26,8 @@ from pathlib import Path
 import anthropic
 from dotenv import load_dotenv
 
+from parsers._common import salvage_json_array
+
 load_dotenv()
 
 _MODEL = os.environ.get('CATEGORISE_MODEL', 'claude-sonnet-5')
@@ -229,7 +231,7 @@ def _batch_classify(transactions: list[dict], system_prompt: str) -> list[str]:
 
     response = client.messages.create(
         model=_MODEL,
-        max_tokens=4000,
+        max_tokens=8000,
         system=system_prompt,
         messages=[{'role': 'user', 'content': user_msg}],
     )
@@ -237,10 +239,14 @@ def _batch_classify(transactions: list[dict], system_prompt: str) -> list[str]:
     text = ''.join(
         block.text for block in response.content if getattr(block, 'type', '') == 'text'
     ).strip()
-    match = re.search(r'\[.*\]', text, re.DOTALL)
-    if not match:
+    # Claude's extended-thinking budget is drawn from the same max_tokens
+    # limit as the reply, so a big batch can get cut off mid-array before
+    # any JSON closes. salvage_json_array keeps every complete leading
+    # category instead of raising and losing the whole batch (and with it,
+    # the whole upload) over a truncated tail.
+    cats = salvage_json_array(text)
+    if not cats:
         raise ValueError(f"Claude returned unexpected output: {text[:200]!r}")
-    cats = json.loads(match.group())
 
     out = []
     for c in cats:

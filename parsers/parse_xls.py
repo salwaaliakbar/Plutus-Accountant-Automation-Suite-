@@ -12,7 +12,7 @@ from pathlib import Path
 
 import openpyxl
 
-from parsers._common import parse_rows
+from parsers._common import find_header_row, parse_rows, rows_to_dicts
 
 
 def parse_xls(path) -> list[dict]:
@@ -20,29 +20,15 @@ def parse_xls(path) -> list[dict]:
 
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     try:
-        ws = wb.worksheets[0]
-        rows_iter = ws.iter_rows(values_only=True)
-        try:
-            raw_headers = next(rows_iter)
-        except StopIteration:
-            return []
-
-        headers = [str(h).strip() if h is not None else None for h in raw_headers]
-
-        rows = []
-        for values in rows_iter:
-            if all(v is None for v in values):
-                continue
-            row = {}
-            for h, v in zip(headers, values):
-                if h is None:
-                    continue
-                row[h] = v
-            rows.append(row)
+        # Use the first sheet that actually has a transaction header row —
+        # exports sometimes lead with a summary / cover sheet.
+        sheets = [list(ws.iter_rows(values_only=True)) for ws in wb.worksheets]
     finally:
         wb.close()
 
-    if not rows:
+    chosen = next((rows for rows in sheets if find_header_row(rows) is not None),
+                  sheets[0] if sheets else [])
+    headers, dict_rows = rows_to_dicts(chosen)
+    if not dict_rows:
         return []
-
-    return parse_rows(rows, [h for h in headers if h is not None])
+    return parse_rows(dict_rows, headers)

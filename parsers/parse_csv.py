@@ -14,41 +14,38 @@ produce identical output.
 """
 
 import csv
+import io
 from pathlib import Path
 
-from parsers._common import parse_rows
+from parsers._common import parse_rows, rows_to_dicts
 
 
-def _open_csv(path: Path):
-    for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
+def _read_text(path: Path) -> str:
+    # Decode the WHOLE file per attempt: a stray £ past the first few KB
+    # used to pass the probe and then crash half-way through reading.
+    raw = path.read_bytes()
+    for enc in ('utf-8-sig', 'cp1252', 'latin-1'):
         try:
-            fh = open(path, newline='', encoding=enc)
-            fh.read(2048)
-            fh.seek(0)
-            return fh, enc
+            return raw.decode(enc)
         except UnicodeDecodeError:
-            try:
-                fh.close()
-            except Exception:
-                pass
-    raise ValueError(f"Cannot decode {path.name} — tried utf-8-sig, utf-8, latin-1, cp1252")
+            continue
+    raise ValueError(f"Cannot decode {path.name} — tried utf-8, cp1252, latin-1")
 
 
 def parse_csv(path) -> list[dict]:
     path = Path(path)
-    fh, _ = _open_csv(path)
+    text = _read_text(path)
     try:
-        reader = csv.DictReader(fh)
-        rows = list(reader)
-        raw_headers = list(reader.fieldnames or [])
-    finally:
-        fh.close()
-
+        dialect = csv.Sniffer().sniff(text[:8192], delimiters=',;	|')
+    except csv.Error:
+        dialect = csv.excel
+    rows = list(csv.reader(io.StringIO(text), dialect))
     if not rows:
         return []
 
-    # Strip whitespace from all headers and row keys
-    headers = [h.strip() for h in raw_headers]
-    rows = [{k.strip(): v for k, v in row.items()} for row in rows]
-
-    return parse_rows(rows, headers)
+    # The header row isn't always row 1 — some banks put account details
+    # above it. rows_to_dicts finds it (shared with parse_xls).
+    headers, dict_rows = rows_to_dicts(rows)
+    if not dict_rows:
+        return []
+    return parse_rows(dict_rows, headers)
