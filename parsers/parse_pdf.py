@@ -180,6 +180,19 @@ _SIDEBAR_SUFFIX = re.compile(
 )
 
 
+_SUB_STATEMENT = re.compile(
+    r'\b(?:pot|savings?|credit\s*card|loan|interest|rewards?)\s+statement\b', re.I)
+
+
+def _is_sub_statement_page(page) -> bool:
+    """A page that opens with 'Pot statement' / 'Savings statement' is a
+    sub-account the main pipeline must not read as more main-account rows.
+    Monzo bundles each Pot's history after the main statement."""
+    text = page.extract_text() or ''
+    head = '\n'.join(text.split('\n')[:4])
+    return bool(_SUB_STATEMENT.search(head))
+
+
 def _parse_barclays(pdf, year_hint: int) -> list[dict]:
     transactions = []
     current_date = None
@@ -193,6 +206,8 @@ def _parse_barclays(pdf, year_hint: int) -> list[dict]:
             pending = None
 
     for page in pdf.pages:
+        if _is_sub_statement_page(page):
+            continue
         text = page.extract_text()
         if not text:
             continue
@@ -313,11 +328,18 @@ def _match_col(headers: list[str], pattern: re.Pattern) -> int | None:
     return None
 
 
+def _parse_generic_table_pages(pdf):
+    """Yield only pages that aren't a sub-statement (Pot / Savings)."""
+    for p in pdf.pages:
+        if not _is_sub_statement_page(p):
+            yield p
+
+
 def _parse_generic_table(pdf, year_hint: int) -> list[dict]:
     """Extract transactions from any PDF that renders a clear table."""
     transactions = []
 
-    for page in pdf.pages:
+    for page in _parse_generic_table_pages(pdf):
         tables = page.extract_tables()
         for table in tables:
             if not table or len(table) < 2:
@@ -571,6 +593,8 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
     rows = []          # one entry per statement line below the header
     cols = None
     for page in pdf.pages:
+        if _is_sub_statement_page(page):
+            continue
         words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
         if not words:
             continue
@@ -612,6 +636,7 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
                 'date': dt[0] if dt else None, 'has_year': bool(dt and dt[2]),
                 'amounts': amounts, 'words': text_words, 'stray': stray,
                 'text': line_text, 'x0': ws[0]['x0'], 'gap': gap,
+                'top': ln['top'], 'bottom': ln['bottom'],
                 'skip': bool(_LAYOUT_SKIP.search(line_text)),
                 'text_left': text_left, 'desc_x0': desc_x0, 'cols': cols,
             })
@@ -637,6 +662,11 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
 
     txns, current_date, pending_text, pending_type = [], None, [], []
     last_month, year_bump = None, 0
+    # Monzo prints a wrapped transaction centred on its date line: the payee
+    # sits on the line just ABOVE the date/amount line (overlapping it) and
+    # the reference just below. 'lead' holds such a line until the dated row
+    # it belongs to arrives; anything else clears it.
+    lead = None
 
     def fix_year(d, has_year):
         # Dates printed without a year ("8 Apr") on a statement that runs
@@ -654,12 +684,17 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
 
     for r in rows:
         if r['skip']:
-            pending_text, pending_type = [], []
+            pending_text, pending_type, lead = [], [], None
             continue
         if r['date']:
             current_date = fix_year(r['date'], r['has_year'])
         typ, desc = split_text(r)
         money = {k: v for k, v in r['amounts'].items() if k != 'balance'}
+
+        if money and first_line_mode and lead and not desc and not typ                 and r['top'] < lead['bottom'] + 2:
+            typ, desc = lead['typ'], lead['desc']
+        if not (not money and r['date'] is None and first_line_mode):
+            lead = None
 
         if not money:
             if r['date'] and not first_line_mode:
@@ -668,8 +703,14 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
                 is_cont = (r['gap'] is not None and r['gap'] < 12 and not r['stray']
                            and r['x0'] > r['text_left'] + 2)
                 if first_line_mode:
-                    if txns and is_cont:
+                    if lead and is_cont:          # payee wrapped over two lines above
+                        lead['desc'] = (lead['desc'] + ' ' + desc).strip()
+                        lead['typ'] = (lead['typ'] + ' ' + typ).strip()
+                        lead['bottom'] = r['bottom']
+                    elif txns and is_cont:
                         txns[-1]['description'] = (txns[-1]['description'] + ' ' + desc).strip()
+                    elif not r['stray'] and r['x0'] > r['text_left'] + 2:
+                        lead = {'desc': desc, 'typ': typ, 'bottom': r['bottom']}
                 elif is_cont or pending_text:
                     pending_text.append(desc); pending_type.append(typ)
             continue
@@ -709,15 +750,36 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
             'balance': balance, '_unsigned': amount_sign == 0,
         })
 
-    # Unsigned single "Amount" column: take direction from the running balance.
-    prev_bal = None
-    for t in txns:
-        if t.pop('_unsigned') and prev_bal is not None and t['balance'] is not None:
-            if t['balance'] < prev_bal - 0.001:
-                t['money_out'], t['money_in'] = t['money_in'], 0.0
-        if t['balance'] is not None:
-            prev_bal = t['balance']
+    _resolve_unsigned(txns)
     return txns
+
+
+def _resolve_unsigned(txns: list) -> None:
+    """Money direction for a single 'Amount' column.
+
+    When the statement marks money out with a sign anywhere (Monzo: -250.00,
+    or 'DR' / brackets), an amount printed without one is money IN — the
+    bank said so. Only when no amount carries a sign at all is the direction
+    taken from the running balance: in date order, the printed balance must
+    equal the previous one plus or minus the amount. A row that fits neither
+    is left as money in and the balance check reports it."""
+    unsigned = [t for t in txns if t.get('_unsigned')]
+    signed_statement = len(unsigned) < len(txns) and any(t['money_out'] for t in txns)
+    if unsigned and not signed_statement:
+        seq = list(reversed(txns)) if len(txns) > 1 and txns[0]['date'] > txns[-1]['date'] else txns
+        prev_bal = None
+        for t in seq:
+            bal = t['balance']
+            if t.get('_unsigned') and prev_bal is not None and bal is not None:
+                amt = t['money_in']
+                if abs(prev_bal - amt - bal) < 0.005:
+                    t['money_out'], t['money_in'] = amt, 0.0
+                elif abs(prev_bal + amt - bal) >= 0.005 and bal < prev_bal:
+                    t['money_out'], t['money_in'] = amt, 0.0
+            if bal is not None:
+                prev_bal = bal
+    for t in txns:
+        t.pop('_unsigned', None)
 
 
 def _reconcile(txns: list) -> tuple[int, int]:
@@ -726,6 +788,9 @@ def _reconcile(txns: list) -> tuple[int, int]:
     mismatches == 0, which proves no row was dropped or put in the wrong
     Paid in / Paid out column."""
     running, checked, bad = None, 0, 0
+    # newest-first statements (Monzo) must be checked oldest-first
+    if len(txns) > 1 and txns[0]['date'] > txns[-1]['date']:
+        txns = list(reversed(txns))
     for t in txns:
         if running is not None:
             running = round(running + t['money_in'] - t['money_out'], 2)
@@ -904,19 +969,38 @@ def _parse_with_ai(pdf, year_hint: int) -> list[dict]:
 # ── Public entry point ────────────────────────────────────────────────────────
 
 _TRAILING_REF = re.compile(r'^(.*\S)\s*\(([^()]*)\)$')
+# Monzo: 'PRENTON DELL LTD (Faster Payments) Reference: LOCUM'
+_MONZO_REF = re.compile(r'^(.*?\S)\s*\(([^()]*)\)\s*Reference:\s*(.*)$', re.I)
+_PAYMENT_TYPE = re.compile(
+    r'^(?:faster payments?|direct (?:credit|debit)|standing order|bacs(?: .*)?|'
+    r'bank transfer|chaps|card payment|transfer)$', re.I)
 
 
 def _split_references(txns: list) -> list:
-    """PDF statements without a Reference column (e.g. Starling) print the
-    reference in brackets after the counterparty — 'LOCUM PAYROL LTD (Asda)'.
-    Split it out so Counter Party and Reference match the client's CSV-era
-    rows instead of the reference being lost inside the name."""
+    """PDF statements without a Reference column print it inside the text.
+    Starling: 'LOCUM PAYROL LTD (Asda)' -> payee + reference 'Asda'.
+    Monzo: 'BOOTS UK LIMITED (Direct Credit) Reference: 9224 2000179520 K'
+    -> payee, payment type 'Direct Credit' and the reference; a bracket
+    holding only a payment type ('Kristaps Mazurs (Faster Payments)') is the
+    type, not a reference. Rows already carrying a reference are left alone."""
     for t in txns:
         if t.get('reference'):
             continue
-        m = _TRAILING_REF.match(t.get('description') or '')
+        desc = (t.get('description') or '').strip()
+        m = _MONZO_REF.match(desc)
         if m:
-            t['description'], t['reference'] = m.group(1).strip(), m.group(2).strip()
+            t['description'], t['reference'] = m.group(1).strip(), m.group(3).strip()
+            if not t.get('subcategory'):
+                t['subcategory'] = m.group(2).strip()
+            continue
+        m = _TRAILING_REF.match(desc)
+        if m:
+            if _PAYMENT_TYPE.match(m.group(2).strip()):
+                t['description'] = m.group(1).strip()
+                if not t.get('subcategory'):
+                    t['subcategory'] = m.group(2).strip()
+            else:
+                t['description'], t['reference'] = m.group(1).strip(), m.group(2).strip()
     return txns
 
 

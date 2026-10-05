@@ -32,8 +32,11 @@ def _doy(month: int, day: int) -> int:
 class YearLabeller:
     """Learns (date -> label) for one year column from existing template rows."""
 
-    def __init__(self, pairs):
-        """pairs – list of (date_or_datetime, label_value) from existing rows."""
+    def __init__(self, pairs, tax_year: bool = False):
+        """pairs – list of (date_or_datetime, label_value) from existing rows.
+        tax_year – the column is a Self Assessment (SA) label: the UK tax
+        year always starts on 6 April, so that boundary is used whenever the
+        client's own rows agree with it."""
         self.groups = {}   # label_str -> {'label': original, 'min': date, 'max': date}
         for d, label in pairs:
             if d is None or label is None:
@@ -82,6 +85,75 @@ class YearLabeller:
 
             best = min(candidates, key=rel)   # earliest observed start day
             self.boundary = (best.month, best.day)
+
+            # Better: the year boundary must fall in the gap between one
+            # year's last row and the next year's first row. A year's first
+            # transaction is often weeks after its real start (Ahmed: 24/25
+            # starts 6 Jul, but the year ends 31 May), so the gaps narrow it
+            # down far more reliably than a first date does.
+            refined = self._boundary_from_gaps()
+            if refined:
+                self.boundary = refined
+
+            # An SA column with too little history to learn from (e.g. one
+            # year, SA25 only) fell back to its first row's date — 3 May for
+            # Kristaps, which labelled 7 Apr – 5 May 2025 as SA25 instead of
+            # SA26. The tax year is fixed by law: use 6 April unless the
+            # client's own rows contradict it.
+            if tax_year and self._fits_boundary((4, 6)):
+                self.boundary = (4, 6)
+
+    def _fits_boundary(self, boundary) -> bool:
+        """True when, with this year start, every label's rows fall in one
+        year and different labels fall in different years."""
+        saved, self.boundary = self.boundary, boundary
+        try:
+            seen = {}
+            for key, g in self.groups.items():
+                y0, y1 = self._year_index(g['min']), self._year_index(g['cap'])
+                if y0 != y1 or seen.setdefault(y0, key) != key:
+                    return False
+            return True
+        finally:
+            self.boundary = saved
+
+    def _boundary_from_gaps(self):
+        """(month, day) that falls in the most year-to-year gaps, preferring
+        6 April (UK tax year), then the 1st of a month. None if no gaps."""
+        ordered = sorted(self.groups.values(), key=lambda g: g['min'])
+        gaps = []      # (last date of one year, first date of the next]
+        for prev, nxt in zip(ordered, ordered[1:]):
+            if prev['cap'] < nxt['min']:
+                gaps.append((prev['cap'], nxt['min']))
+        if not gaps:
+            return None
+
+        def in_gap(m, d, lo, hi):
+            for y in (hi.year - 1, hi.year):
+                try:
+                    b = date(y, m, d)
+                except ValueError:
+                    continue
+                if lo < b <= hi:
+                    return True
+            return False
+
+        days = [(m, d) for m in range(1, 13) for d in range(1, 32)
+                if d <= (28 if m == 2 else 30 if m in (4, 6, 9, 11) else 31)]
+        score = {md: sum(in_gap(*md, lo, hi) for lo, hi in gaps) for md in days}
+        top = max(score.values())
+        if top == 0:
+            return None
+        best = [md for md in days if score[md] == top]
+        if (4, 6) in best:
+            return (4, 6)
+        firsts = [md for md in best if md[1] == 1]
+        if not firsts:
+            return None
+        # several month starts fit (one wide gap): take the first one after
+        # the previous year's last row, i.e. the year ended in that month
+        lo = gaps[-1][0]
+        return min(firsts, key=lambda md: (_doy(*md) - _doy(lo.month, lo.day)) % 365)
 
     @property
     def learned(self) -> bool:
@@ -154,7 +226,7 @@ def learn_year_columns(ws, year_cols: dict, date_col: int, last_data_row: int) -
                     d = _parse_date_str(d)
                 if d is not None:
                     pairs.append((d, label))
-        lab = YearLabeller(pairs)
+        lab = YearLabeller(pairs, tax_year=(name == 'sa'))
         out[name] = lab if lab.learned else None
     return out
 
