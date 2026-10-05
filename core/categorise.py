@@ -74,6 +74,12 @@ SYNONYMS = [
     ['Dividends', 'Dividend'],
     ['Sundry', 'Sundries'],
     ['Refund', 'Refunds'],
+    # professional bodies: a client who books these as plain 'College' /
+    # 'AOP' / 'GOC' must not get a second 'Professional - …' row for them
+    ['College', 'Professional - College', 'College of Optometrists'],
+    ['AOP', 'Professional - AOP', 'Insurance - AOP'],
+    ['GOC', 'Professional - GOC'],
+    ['Donation', 'Donations', 'Charity'],
 ]
 
 # How sure the client's history must be before its category is reused
@@ -171,17 +177,34 @@ def _cat_key(s) -> str:
     return k[:-1] if len(k) > 3 and k.endswith('s') else k
 
 
-def _make_canonicaliser(client_cats: list):
+def _make_canonicaliser(client_cats: list, analysis_vocab: list | None = None):
     """Return a function mapping any category spelling to the one to use:
-    the client's own spelling when they have one for that meaning, else the
-    group's default, else the master list's spelling, else the first
-    spelling seen this run."""
-    client_by_key = {_cat_key(c): c for c in client_cats}
+    the client's own spelling when they have one for that meaning (their
+    RAW rows first, then the names their Analysis formulas look up), else
+    the group's default, else the master list's spelling, else the first
+    spelling seen this run. Analysis names also match despite small typos
+    ('Inusrance - AOP' for 'Insurance - AOP')."""
+    client_by_key = {_cat_key(c): c for c in analysis_vocab or []}
+    client_by_key.update({_cat_key(c): c for c in client_cats})
+    fuzzy_pool = [(k, c) for k, c in ((_cat_key(c), c) for c in analysis_vocab or [])
+                  if len(k) >= 6]
+
+    def client_spelling(k):
+        if k in client_by_key:
+            return client_by_key[k]
+        if len(k) >= 6:
+            for ck, c in fuzzy_pool:
+                if SequenceMatcher(None, k, ck).ratio() >= 0.9:
+                    return c
+        return None
+
     master_by_key = {_cat_key(c): c for c in CATEGORIES}
     group_of = {}
     for group in SYNONYMS:
         keys = [_cat_key(s) for s in group]
-        chosen = next((client_by_key[k] for k in keys if k in client_by_key), group[0])
+        raw_hit = next((c for c in client_cats if _cat_key(c) in keys), None)
+        chosen = raw_hit or next(
+            (s for s in (client_spelling(k) for k in keys) if s), group[0])
         for k in keys:
             group_of[k] = chosen
     seen = {}
@@ -195,6 +218,9 @@ def _make_canonicaliser(client_cats: list):
             return client_by_key[k]
         if k in group_of:
             return group_of[k]
+        mine = client_spelling(k)       # small typos in the Analysis names
+        if mine:
+            return mine
         if k in master_by_key:
             return master_by_key[k]
         return seen.setdefault(k, cat)
@@ -320,6 +346,28 @@ def _harmonise_people(transactions, results, sources, client_cats) -> int:
             if sources[i] == 'ai' and results[i] != best:
                 results[i] = best
                 changed += 1
+    return changed
+
+
+def _fill_unknown_from_same_payee(transactions, results) -> list[int]:
+    """An 'Unknown' row whose payee (same direction of money) got exactly one
+    category everywhere else in this statement takes that category — e.g.
+    one 'OPTIC VILLAGE LTD' credit left Unknown while every other one is
+    Income. Returns the indices changed (the caller keeps them marked for
+    review)."""
+    seen: dict[tuple, set] = {}
+    for t, c in zip(transactions, results):
+        key = _payee_key(t.get('description') or '')
+        if len(key) >= 3 and c != 'Unknown':
+            seen.setdefault((key, _direction(t)), set()).add(c)
+    changed = []
+    for i, t in enumerate(transactions):
+        if results[i] != 'Unknown':
+            continue
+        cats = seen.get((_payee_key(t.get('description') or ''), _direction(t)))
+        if cats and len(cats) == 1:
+            results[i] = next(iter(cats))
+            changed.append(i)
     return changed
 
 
@@ -462,6 +510,7 @@ def categorise_detailed(
     transactions: list[dict],
     client_examples: list | None = None,
     batch_size: int = 40,
+    analysis_vocab: list | None = None,
 ) -> tuple[list[str], list[bool]]:
     """Return (categories, needs_review), one entry per transaction.
 
@@ -469,10 +518,15 @@ def categorise_detailed(
     answers taken from the accountant's own past decisions never are.
     client_examples – (description/type/reference/category/direction) dicts
     extracted from the client's template.
+    analysis_vocab – category names the template's Analysis formulas look
+    up (see excel_writer.extract_analysis_vocabulary); answers are spelled
+    to match them.
     """
     example_lines, client_cats = _build_examples(client_examples)
-    system_prompt = _build_system_prompt(example_lines, client_cats)
-    canon = _make_canonicaliser(client_cats)
+    vocab = client_cats + [c for c in analysis_vocab or []
+                           if _cat_key(c) not in {_cat_key(x) for x in client_cats}]
+    system_prompt = _build_system_prompt(example_lines, vocab)
+    canon = _make_canonicaliser(client_cats, analysis_vocab)
     rules, ambiguous = _history_rules(client_examples)
     learned = _load_learned()
 
@@ -522,6 +576,11 @@ def categorise_detailed(
     changed = _harmonise_people(transactions, results, sources, client_cats)
     if changed:
         print(f"  [categorise] {changed} payment(s) to the same person aligned")
+    filled = _fill_unknown_from_same_payee(transactions, results)
+    for i in filled:
+        sure[i] = False             # still worth a look
+    if filled:
+        print(f"  [categorise] {len(filled)} 'Unknown' row(s) given their payee's category")
 
     review = [src == 'ai' and (not s or c == 'Unknown')
               for c, s, src in zip(results, sure, sources)]
