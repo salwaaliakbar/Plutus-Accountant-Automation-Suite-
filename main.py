@@ -78,12 +78,22 @@ def main():
     for t in transactions[:3]:
         print(f"  {t['date']}  in={t['money_in']:.2f}  out={t['money_out']:.2f}  {t['description'][:50]}")
 
+    from core.excel_writer import prepare_new_transactions
+    transactions, dropped = prepare_new_transactions(transactions, template_path, args.sheet)
+    if dropped:
+        print(f"[main] {dropped} transaction(s) already in the template — skipped.")
+    if not transactions:
+        print("[main] Every transaction is already in the template. Nothing to add.")
+        sys.exit(0)
+
     # ── 2. Categorise ─────────────────────────────────────────────────────────
     print("[main] Categorising transactions...")
     from core.categorise import categorise_detailed
-    from core.excel_writer import extract_client_examples
+    from core.excel_writer import extract_client_examples, extract_analysis_vocabulary
     client_examples = extract_client_examples(template_path, sheet_name=args.sheet)
-    categories, review = categorise_detailed(transactions, client_examples=client_examples)
+    categories, review = categorise_detailed(
+        transactions, client_examples=client_examples,
+        analysis_vocab=extract_analysis_vocabulary(template_path))
     print(f"[main] Categories assigned. {sum(review)} row(s) marked for the accountant to check.")
 
     # Print summary
@@ -95,7 +105,7 @@ def main():
     # ── 3. Write to Excel ─────────────────────────────────────────────────────
     print(f"[main] Writing to {output_path} ...")
     from core.excel_writer import write_workbook
-    write_workbook(
+    problems = write_workbook(
         transactions,
         categories,
         template_path=template_path,
@@ -103,6 +113,13 @@ def main():
         sheet_name=args.sheet,
         review=review,
     )
+    if problems:
+        print(f"[main] WARNING: {len(problems)} balance(s) do not add up — "
+              f"check these rows against the statement:")
+        for p in problems:
+            print(f"    {p}")
+    else:
+        print("[main] Balances reconcile: every new row = previous balance + amount.")
 
     # ── 4. Recalculate (LibreOffice) ──────────────────────────────────────────
     print("[main] Attempting LibreOffice recalculation...")

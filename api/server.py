@@ -62,28 +62,42 @@ def _run_pipeline(job_id: str, file_path: Path, original_name: str, template_pat
         else:
             raise ValueError(f'Unsupported file type: {suffix}')
 
-        n = len(transactions)
-        if n == 0:
+        if not transactions:
             raise ValueError('No transactions found in the uploaded file.')
 
+        from core.excel_writer import prepare_new_transactions
+        transactions, dropped = prepare_new_transactions(transactions, template_path)
+        n = len(transactions)
+        if n == 0:
+            raise ValueError('Every transaction in this statement is already in the workbook.')
+        skipped = f' ({dropped} already in the workbook, skipped)' if dropped else ''
+
         _update(job, step='categorising', progress=40,
-                message=f'Parsed {n} transactions. Categorising with AI…')
+                message=f'Parsed {n} new transactions{skipped}. Categorising with AI…')
         from core.categorise import categorise_detailed
-        from core.excel_writer import extract_client_examples
+        from core.excel_writer import extract_client_examples, extract_analysis_vocabulary
         client_examples = extract_client_examples(template_path)
-        categories, review = categorise_detailed(transactions, client_examples=client_examples)
+        categories, review = categorise_detailed(
+            transactions, client_examples=client_examples,
+            analysis_vocab=extract_analysis_vocabulary(template_path))
 
         _update(job, step='writing', progress=75, message='Categorised. Writing to Excel…')
         from core.excel_writer import write_workbook
         stem = Path(original_name).stem
         output_path = OUTPUT_DIR / f"{job_id}_{stem}_processed.xlsx"
-        write_workbook(transactions, categories, template_path, output_path, review=review)
+        problems = write_workbook(transactions, categories, template_path, output_path,
+                                  review=review)
 
         from collections import Counter
         cat_summary = dict(Counter(categories).most_common(5))
+        warn = ''
+        if problems:
+            warn = (f' WARNING: {len(problems)} balance(s) do not add up — check these '
+                    f'rows against the statement: ' + '; '.join(problems[:3]))
         _update(job, step='done', progress=100, status='done',
-                message=(f'Complete! {n} transactions processed. '
-                         f'{sum(review)} highlighted in yellow for checking.'),
+                message=(f'Complete! {n} transactions processed{skipped}. '
+                         f'{sum(review)} highlighted in yellow for checking.{warn}'),
+                balance_problems=problems,
                 transaction_count=n,
                 review_count=sum(review),
                 top_categories=cat_summary,

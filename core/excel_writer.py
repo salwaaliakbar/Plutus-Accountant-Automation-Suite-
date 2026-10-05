@@ -36,16 +36,64 @@ from core.year_labels import YearLabeller, learn_year_columns
 # ── Sheet / header helpers ────────────────────────────────────────────────────
 
 def _detect_sheet(wb: openpyxl.Workbook, keyword: str) -> str:
+    """Find the RAW transactions sheet or the Analysis summary sheet.
+
+    First tries the sheet name — most templates have 'raw' and 'analysis' in
+    the title. When nothing matches (clients use 'Transactions', 'Summary',
+    their trading name, etc.), scores every sheet by content and picks the
+    best match. The transactions sheet looks like: many rows, a Date header
+    and money columns in row 1. The analysis sheet looks like: fewer rows,
+    formulas pointing elsewhere, and no transaction headers."""
     kw = keyword.lower()
     matches = [name for name in wb.sheetnames if kw in name.lower()]
-    if not matches:
-        raise KeyError(f"No sheet containing '{keyword}' found in {wb.sheetnames}")
     if kw == 'raw':
-        # a sheet like 'Analysis 24 Raw (2)' is an analysis sheet, not the RAW tab
-        pure = [m for m in matches if 'analysis' not in m.lower()]
+        pure = [m for m in matches if 'analysis' not in m.lower()
+                and 'summary' not in m.lower()]
         if pure:
             return pure[0]
-    return matches[0]
+    if matches:
+        return matches[0]
+
+    # Content-based fallback — scores each sheet by how much it looks like
+    # the kind we're after.
+    best, best_score = None, -1
+    for name in wb.sheetnames:
+        ws = wb[name]
+        score = _sheet_score(ws, kw)
+        if score > best_score:
+            best, best_score = name, score
+    if best is None or best_score <= 0:
+        raise KeyError(f"No {keyword} sheet found in {wb.sheetnames} "
+                       f"(looked by name and by content)")
+    return best
+
+
+def _sheet_score(ws, kind: str) -> int:
+    """How likely is this sheet to be a 'raw' transactions sheet or an
+    'analysis' summary? Higher is better. Transactions: has Date + a money
+    column header in row 1, and many rows. Analysis: has formulas and few
+    rows."""
+    headers = [str(c.value or '').strip().lower()
+               for c in next(ws.iter_rows(min_row=1, max_row=1), ())]
+    row_count = ws.max_row
+    formula_count = sum(
+        1 for row in ws.iter_rows(min_row=1, max_row=min(row_count, 100))
+        for c in row if isinstance(c.value, str) and c.value.startswith('=')
+    )
+    has_date = any(h in {'date', 'transaction date', 'posting date'} for h in headers)
+    has_money = any(h in {'amount', 'net', 'money in', 'money out', 'paid in',
+                          'paid out', 'credit', 'debit', 'in', 'out', 'value',
+                          'balance'} for h in headers)
+    has_uc = any('category' in h or h == 'uc' for h in headers)
+
+    if kind == 'raw':
+        if not has_date or not has_money:
+            return 0
+        return row_count + (50 if has_uc else 0)
+    # kind == 'analysis'
+    if has_date and has_money and row_count > 50:
+        return 0        # looks like a transactions sheet, not a summary
+    return formula_count + (20 if row_count < 100 else 0)
 
 
 def _read_headers(ws) -> dict:
@@ -138,6 +186,31 @@ def _relocate_pivot_clear_of_grid(ws_a, grid_last_col: int) -> None:
         delta = target - start_col
         loc.ref = (f'{get_column_letter(start_col + delta)}{r1}:'
                    f'{get_column_letter(end_col + delta)}{r2}')
+        _repoint_getpivotdata(ws_a, c1, r1, get_column_letter(start_col + delta))
+
+
+def _repoint_getpivotdata(ws_a, old_col: str, row: str, new_col: str) -> None:
+    """The accountant's GETPIVOTDATA(..., $A$3, ...) formulas name the pivot
+    by a cell inside it; once the pivot moves, point them at its new place
+    or they all turn into #REF!. Covers the pivot's own sheet (plain $A$3)
+    and every other sheet ('Analysis 25'!$A$3 / Analysis!$A$3)."""
+    title = ws_a.title
+    own = r'(?<![!A-Za-z0-9_$])'
+    other = "(?:'" + re.escape(title.replace("'", "''")) + "'|" + re.escape(title) + ")!"
+    cell = r'(\$?)' + old_col + r'(\$?)' + row + r'(?!\d)'
+    head = r'(GETPIVOTDATA\(\s*"[^"]*"\s*,\s*)'
+    rx_own = re.compile(head + own + cell, re.I)
+    rx_other = re.compile(head + '(' + other + ')' + cell, re.I)
+    for ws in ws_a.parent.worksheets:
+        for line in ws.iter_rows():
+            for c in line:
+                v = c.value
+                if not (isinstance(v, str) and v.startswith('=') and 'GETPIVOTDATA' in v.upper()):
+                    continue
+                if ws is ws_a:
+                    v = rx_own.sub(lambda m: f'{m[1]}{m[2]}{new_col}{m[3]}{row}', v)
+                v = rx_other.sub(lambda m: f'{m[1]}{m[2]}{m[3]}{new_col}{m[4]}{row}', v)
+                c.value = v
 
 
 def _align_pivot_columns(wb, sheet: str, cache, col1: str, row1: str, col2: str):
@@ -287,6 +360,193 @@ def extract_client_examples(template_path, sheet_name: str = None) -> list:
             'direction': direction(r),
         })
     return examples
+
+
+# A criteria range on this sheet's column A (A:A or $A$5:$A$40) followed by
+# the criteria cell — covers SUMIF(A:A,K22,D:D) and SUMIFS(D:D,A:A,K22).
+_SUMIF_A_RE = re.compile(
+    r"(?<![A-Za-z0-9_!$'])\$?A(?:\$?\d+)?:\$?A(?:\$?\d+)?\s*,\s*\$?([A-Z]{1,3})\$?(\d+)(?![\d(])")
+
+
+def extract_analysis_vocabulary(template_path) -> list:
+    """Category names the accountant's own Analysis workings look up, e.g.
+    'Inusrance - AOP' / 'Subscription' / 'Charity' in a P&L block built from
+    =SUMIF(A:A,K22,D:D). New rows must use exactly these names, or those
+    formulas never pick them up. Returns the labels in sheet order."""
+    wb = openpyxl.load_workbook(template_path)
+    try:
+        ws = wb[_detect_sheet(wb, 'analysis')]
+    except KeyError:
+        return []
+    out = []
+    for row in ws.iter_rows():
+        for cell in row:
+            v = cell.value
+            if not (isinstance(v, str) and v.startswith('=') and 'SUMIF' in v.upper()):
+                continue
+            for col, r in _SUMIF_A_RE.findall(v):
+                label = ws[f'{col}{r}'].value
+                # 'Equipment?' is the accountant's own query, not a category
+                if isinstance(label, str) and label.strip() and not label.startswith('=') \
+                        and not label.strip().endswith('?') and label not in out:
+                    out.append(label)
+    return out
+
+
+# ── New transactions only, with complete balances ─────────────────────────────
+
+def _signed(t: dict) -> float:
+    return round((t.get('money_in') or 0) - (t.get('money_out') or 0), 2)
+
+
+def fill_missing_balances(transactions: list) -> int:
+    """Some statements (e.g. Starling PDFs) print a balance only on the last
+    transaction of each day. Fill the gaps from the neighbouring printed
+    balances, but only where the run of filled rows lands exactly on the next
+    printed balance — so a filled balance is always one the bank's own
+    figures prove. Returns how many balances were filled."""
+    n = len(transactions)
+    filled = 0
+
+    # Gaps at the very start or end have a printed balance on one side only,
+    # so they can't be checked on their own. Fill them only when the whole
+    # statement is proven to run in this order: every printed balance equals
+    # the one before it plus the amounts in between (a newest-first
+    # statement, or a mis-parsed amount, fails this and they stay blank).
+    known = [k for k, t in enumerate(transactions) if t.get('balance') is not None]
+    order_proven = len(known) >= 2 and all(
+        abs(round(transactions[a]['balance']
+                  + sum(_signed(t) for t in transactions[a + 1:b + 1]), 2)
+            - transactions[b]['balance']) < 0.005
+        for a, b in zip(known, known[1:]))
+
+    i = 0
+    while i < n:
+        if transactions[i].get('balance') is not None:
+            i += 1
+            continue
+        j = i                          # transactions[i:j] have no balance
+        while j < n and transactions[j].get('balance') is None:
+            j += 1
+        prev = transactions[i - 1]['balance'] if i > 0 else None
+        nxt = transactions[j]['balance'] if j < n else None
+        run = []
+        if prev is not None:
+            b = prev
+            for t in transactions[i:j]:
+                b = round(b + _signed(t), 2)
+                run.append(b)
+            if nxt is None:            # gap at the very end
+                ok = order_proven
+            else:
+                ok = abs(b + _signed(transactions[j]) - nxt) < 0.005
+        elif nxt is not None:          # gap at the very start: work backwards
+            b = nxt
+            for t in reversed(transactions[i + 1:j + 1]):
+                b = round(b - _signed(t), 2)
+                run.append(b)
+            run.reverse()
+            ok = order_proven
+        else:
+            ok = False
+        if ok:
+            for t, b in zip(transactions[i:j], run):
+                t['balance'] = b
+            filled += j - i
+        i = j
+    return filled
+
+
+def drop_rows_already_in_template(transactions: list, template_path,
+                                  sheet_name: str = None) -> tuple[list, int]:
+    """Remove transactions the template's RAW sheet already holds — a new
+    statement usually overlaps the last few days already entered. A row
+    matches when date and amount agree and so does either the balance or
+    the counterparty; each existing row can match only one new transaction,
+    so genuine same-day repeats are kept. Returns (kept, dropped count)."""
+    wb = openpyxl.load_workbook(template_path, data_only=True)
+    try:
+        ws = wb[sheet_name] if (sheet_name and sheet_name in wb.sheetnames) \
+            else wb[_detect_sheet(wb, 'raw')]
+    except KeyError:
+        return transactions, 0
+    hdrs = _read_headers(ws)
+    date_col = _col(hdrs, 'Date')
+    desc_col = _col(hdrs, *DESC_COLS)
+    in_col, out_col = _col(hdrs, *IN_COLS), _col(hdrs, *OUT_COLS)
+    amt_col = _col(hdrs, 'Amount', 'Value', 'NET', 'Net')
+    bal_col = _col(hdrs, 'Balance', 'Running Balance')
+    if not date_col:
+        return transactions, 0
+
+    def num(r, c):
+        v = ws.cell(r, c).value if c else None
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    def as_date(v):
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+        if isinstance(v, str):
+            for fmt in _DATE_FMTS:
+                try:
+                    return datetime.strptime(v.strip(), fmt).date()
+                except ValueError:
+                    pass
+        return None
+
+    def desc_key(s):
+        return re.sub(r'[^a-z0-9]+', '', str(s or '').lower())
+
+    existing = {}      # (date, amount) -> [[balance, desc key, used], ...]
+    for r in range(2, ws.max_row + 1):
+        d = as_date(ws.cell(r, date_col).value)
+        if d is None:
+            continue
+        amt = num(r, amt_col)
+        if amt is None and (in_col or out_col):
+            p_in, p_out = num(r, in_col) or 0, num(r, out_col) or 0
+            amt = p_in - abs(p_out) if (p_in or p_out) else None
+        if amt is None:
+            continue
+        existing.setdefault((d, round(amt, 2)), []).append(
+            [num(r, bal_col), desc_key(ws.cell(r, desc_col).value if desc_col else ''), False])
+
+    kept, dropped = [], 0
+    for t in transactions:
+        d = t['date'].date() if isinstance(t['date'], datetime) else t['date']
+        bal, dk = t.get('balance'), desc_key(t.get('description'))
+        match = None
+        for row in existing.get((d, _signed(t)), []):
+            if row[2]:
+                continue
+            same_bal = bal is not None and row[0] is not None and abs(bal - row[0]) < 0.005
+            if same_bal or (dk and dk == row[1]):
+                match = row
+                break
+        if match:
+            match[2] = True
+            dropped += 1
+            print(f"  [excel_writer]   already in template, skipped: {d} "
+                  f"{_signed(t):+.2f} {t.get('description') or ''}")
+        else:
+            kept.append(t)
+    return kept, dropped
+
+
+def prepare_new_transactions(transactions: list, template_path,
+                             sheet_name: str = None) -> tuple[list, int]:
+    """Fill statement balance gaps, then drop rows already in the template.
+    Returns (transactions to add, number dropped as already present)."""
+    filled = fill_missing_balances(transactions)
+    if filled:
+        print(f"  [excel_writer] Filled {filled} balance(s) the statement left blank "
+              f"(checked against its printed balances)")
+    kept, dropped = drop_rows_already_in_template(transactions, template_path, sheet_name)
+    if dropped:
+        print(f"  [excel_writer] Skipped {dropped} transaction(s) already in the template")
+    return kept, dropped
 
 
 # ── Fallback year formatting (only when template has no existing rows) ───────
@@ -508,10 +768,21 @@ def write_workbook(
             return lab.label_for(d)
         return _fallback_year_label(d, fallback_style)
 
+    # Categories go in with the client's exact spelling — 'Professional fee '
+    # with its trailing space — since SUMIFS / VLOOKUP match text exactly.
+    raw_spelling = {}
+    if uc_col:
+        for r_scan in range(2, last_row + 1):
+            v = ws.cell(r_scan, uc_col).value
+            if isinstance(v, str) and v.strip() and not v.startswith('='):
+                raw_spelling.setdefault(v.strip(), v)
+
     # ── Write transaction rows ────────────────────────────────────────────────
     for i, (txn, cat) in enumerate(zip(transactions, categories)):
         r = last_row + 1 + i
         seq = last_no + 1 + i
+        if isinstance(cat, str):
+            cat = raw_spelling.get(cat.strip(), cat)
 
         d = txn['date']
         if isinstance(d, datetime):
@@ -600,11 +871,25 @@ def write_workbook(
 
     new_last = last_row + len(transactions)
 
+    # The template's filter (e.g. A1:P103) must cover the new rows too, or
+    # filtering in Excel silently leaves them out.
+    m = _REF_RE.match(ws.auto_filter.ref or '')
+    if m and int(m.group(4)) >= last_row:
+        c1, r1, c2, _ = m.groups()
+        ws.auto_filter.ref = f'{c1}{r1}:{c2}{max(new_last, int(m.group(4)))}'
+
     # A ready-made column for the accountant's corrections, right of the AI's
-    # category — only when that column is completely free.
+    # category when that column is completely free — otherwise (e.g. Ahmed's
+    # 'Type' VLOOKUP sits there) the first empty column after the sheet's
+    # data. learn_from_feedback finds it by its header, wherever it is.
     if uc_col and not _col(hdrs, *CORRECTION_COLS):
-        corr_col = uc_col + 1
-        if all(ws.cell(r, corr_col).value in (None, '') for r in range(1, ws.max_row + 1)):
+        def empty(c):
+            return all(ws.cell(r, c).value in (None, '') for r in range(1, ws.max_row + 1))
+        if empty(uc_col + 1):
+            corr_col = uc_col + 1
+        else:       # formatted-but-blank columns don't count as used
+            corr_col = 1 + max(c for c in range(1, ws.max_column + 1) if not empty(c))
+        if empty(corr_col):
             head = ws.cell(1, corr_col, value=CORRECTION_HEADER)
             head._style = copy(ws.cell(1, uc_col)._style)
             ws.column_dimensions[get_column_letter(corr_col)].width = max(
@@ -628,16 +913,35 @@ def write_workbook(
 
     if analysis_name and pivot_year_col and net_source_col and uc_col:
         ws_a = wb[analysis_name]
-        _update_analysis(ws_a, ws, pivot_year_col, net_source_col,
-                         uc_col, last_data_row=new_last)
-        print(f"  [excel_writer] Updated {analysis_name} in place.")
+        # Safe mode: if we can't make sense of the Analysis layout, leave it
+        # alone — the pivot's own refresh-on-open brings in the new rows,
+        # and nothing of the accountant's own working is at risk.
+        snapshot = _snapshot_sheet(ws_a)
+        try:
+            _update_analysis(ws_a, ws, pivot_year_col, net_source_col,
+                             uc_col, last_data_row=new_last)
+            problem = _verify_analysis_safe(ws_a, snapshot)
+            if problem:
+                _restore_sheet(ws_a, snapshot)
+                print(f"  [excel_writer] Analysis layout unfamiliar ({problem}); "
+                      f"leaving {analysis_name} untouched — pivot refresh on open "
+                      f"will pick up the new rows.")
+            else:
+                print(f"  [excel_writer] Updated {analysis_name} in place.")
 
-        grid_last_col = 1
-        c = 2
-        while ws_a.cell(4, c).value not in (None, ''):
-            grid_last_col = c
-            c += 1
-        _relocate_pivot_clear_of_grid(ws_a, grid_last_col)
+                # Grid's rightmost column: the farthest-right non-blank cell
+                # in any of the pivot's own header rows.
+                grid_last_col = 1
+                for r in range(2, 6):
+                    c = 2
+                    while ws_a.cell(r, c).value not in (None, ''):
+                        grid_last_col = max(grid_last_col, c)
+                        c += 1
+                _relocate_pivot_clear_of_grid(ws_a, grid_last_col)
+        except Exception as exc:
+            _restore_sheet(ws_a, snapshot)
+            print(f"  [excel_writer] Analysis update failed ({exc}); {analysis_name} "
+                  f"left untouched — pivot refresh on open will pick up new rows.")
     elif analysis_name:
         print("  [excel_writer] Missing year/net/category columns — Analysis left untouched.")
 
@@ -654,6 +958,119 @@ def write_workbook(
     wb.save(output_path)
     print(f"  [excel_writer] Saved -> {output_path}")
 
+    problems = reconcile_balances(transactions, ws.cell(last_row, bal_col).value
+                                  if bal_col and last_row > 1 else None)
+    for p in problems:
+        print(f"  [excel_writer] BALANCE WARNING: {p}")
+
+    changed = _check_original_rows_untouched(template_path, output_path, ws.title,
+                                             last_row)
+    if changed:
+        msg = f"Original rows modified unexpectedly: {changed[:3]}"
+        print(f"  [excel_writer] INTEGRITY WARNING: {msg}")
+        problems.append(msg)
+    return problems
+
+
+def _check_original_rows_untouched(template_path, output_path, sheet_name: str,
+                                    last_row: int) -> list:
+    """After writing, verify not a single original transaction cell changed.
+    This is a hard guarantee for any template, however unusual: appending
+    new rows must never touch what was already there."""
+    orig = openpyxl.load_workbook(template_path)
+    new = openpyxl.load_workbook(output_path)
+    if sheet_name not in orig.sheetnames or sheet_name not in new.sheetnames:
+        return []
+    a, b = orig[sheet_name], new[sheet_name]
+    diffs = []
+    for r in range(1, last_row + 1):
+        for c in range(1, a.max_column + 1):
+            v1, v2 = a.cell(r, c).value, b.cell(r, c).value
+            if v1 == v2:
+                continue
+            # openpyxl rounds floats on save (16.846310000000003 -> 16.84631);
+            # that's a lossless re-print, not a data change.
+            if (isinstance(v1, float) and isinstance(v2, float)
+                    and abs(v1 - v2) < 1e-6):
+                continue
+            # row 1 is the header — a new 'Correct category' column is allowed.
+            if r == 1 and v1 is None:
+                continue
+            diffs.append(f"{a.cell(r, c).coordinate}: {v1!r} -> {v2!r}")
+    return diffs
+
+
+def reconcile_balances(transactions: list, opening=None) -> list:
+    """Check every balance against the one before it plus the row's amount,
+    starting from the template's last balance. Returns readable problems
+    (empty when everything adds up). A break means a missed, doubled or
+    misread transaction somewhere — the accountant must be told."""
+    problems = []
+    prev = opening if isinstance(opening, (int, float)) and not isinstance(opening, bool) else None
+    for t in transactions:
+        bal = t.get('balance')
+        if bal is None:
+            prev = None                 # can't check across a blank balance
+            continue
+        if prev is not None and abs(round(prev + _signed(t), 2) - bal) >= 0.005:
+            d = t['date'].date() if isinstance(t['date'], datetime) else t['date']
+            problems.append(
+                f"{d} {t.get('description') or ''} {_signed(t):+.2f}: balance {bal:.2f} "
+                f"but previous {prev:.2f} {_signed(t):+.2f} = {prev + _signed(t):.2f}")
+        prev = bal
+    return problems
+
+
+# ── Safe-mode guards: snapshot, restore, verify ──────────────────────────────
+
+def _snapshot_sheet(ws) -> dict:
+    """Capture every cell's value so we can roll back on an unsafe write."""
+    return {(c.row, c.column): c.value for row in ws.iter_rows() for c in row
+            if c.value is not None}
+
+
+def _restore_sheet(ws, snapshot: dict) -> None:
+    """Put the sheet back exactly as _snapshot_sheet saw it. Cells the
+    writer added that weren't in the snapshot are cleared."""
+    current = {(c.row, c.column) for row in ws.iter_rows() for c in row
+               if c.value is not None}
+    for coord in current - snapshot.keys():
+        ws.cell(*coord).value = None
+    for (r, c), v in snapshot.items():
+        ws.cell(r, c).value = v
+
+
+def _verify_analysis_safe(ws, snapshot: dict) -> str | None:
+    """Check that the Analysis update didn't destroy anything important.
+    Returns a short reason to roll back, or None if the update looks fine.
+
+    Red flags:
+      - An original text value that wasn't a pivot header or category label
+        got replaced with None or a different label (accountant's working lost).
+      - A cell holding a formula was blanked (SUMIFs/GETPIVOTDATA destroyed).
+      - A category label that was in the snapshot vanished entirely from
+        column A (losing a BS/PL tag the accountant lined up next to it)."""
+    labels_before = {str(v).strip() for (r, c), v in snapshot.items()
+                     if c == 1 and isinstance(v, str) and v.strip()
+                     and not v.startswith('=')
+                     and str(v).strip().lower() not in {'row labels', 'grand total'}
+                     and not str(v).lower().startswith('sum of')}
+    labels_after = {str(ws.cell(r, 1).value or '').strip()
+                    for r in range(1, ws.max_row + 1)
+                    if ws.cell(r, 1).value not in (None, '')}
+    lost = labels_before - labels_after
+    if lost:
+        return f'category label(s) vanished: {sorted(lost)[:3]}'
+
+    # A formula cell blanked by the writer is almost always a bug.
+    for (r, c), v in snapshot.items():
+        if isinstance(v, str) and v.startswith('=') and ws.cell(r, c).value in (None, ''):
+            # Allow the SUMIFS cells we deliberately rewrite (col 2+ in the grid)
+            if c >= 2 and r >= 3:
+                continue
+            return f'formula at {ws.cell(r, c).coordinate} was lost'
+    return None
+
 
 # ── Analysis update (values only — formatting preserved) ─────────────────────
 
@@ -663,13 +1080,15 @@ def _update_analysis(ws_a, raw_ws, year_col, net_col, uc_col, last_data_row) -> 
     net_letter  = get_column_letter(net_col)
     uc_letter   = get_column_letter(uc_col)
 
-    data_cats = []
+    data_cats = []              # RAW's own spelling, one per stripped name
+    seen_cats = set()
     for r in range(2, last_data_row + 1):
         c = raw_ws.cell(r, uc_col).value
         if c is not None and str(c).strip() and not str(c).startswith('='):
             cs = str(c).strip()
-            if cs not in data_cats:
-                data_cats.append(cs)
+            if cs not in seen_cats:
+                seen_cats.add(cs)
+                data_cats.append(str(c))
 
     # Year columns: the RAW year column's own labels. Row-4 cells only count
     # if they really are such labels — some templates keep the accountant's
@@ -685,11 +1104,49 @@ def _update_analysis(ws_a, raw_ws, year_col, net_col, uc_col, last_data_row) -> 
             data_years.append(v)
     known = {str(y).strip() for y in data_years}
 
+    # Only the unbroken run of year headers from column B is the grid.
+    # Year labels further right are the accountant's own side workings (e.g.
+    # 'BS'/'PL' tags in E, then their own 22/23 / 23/24 SUMIF summary in
+    # G:H) — counting those made the grid swallow and wipe those columns.
+    # A header also counts when it is shaped like a year label ('21/22',
+    # 'FY23', 'SA24', 2023) even if no RAW row carries it any more —
+    # otherwise one retired year at B4 would hide the whole grid.
+    # Bare numbers like 50 (side workings) must NOT count, so a label needs
+    # two year parts ('21/22'), a prefix ('FY23', 'SA24/25') or 19xx/20xx.
+    year_like = re.compile(
+        r'^(?:(?:FY|SA|YE)\s*\d{2}(?:\d{2})?(?:\s*[/.\-]\s*\d{2}(?:\d{2})?)?'
+        r'|\d{2}(?:\d{2})?\s*[/\-]\s*\d{2}(?:\d{2})?'
+        r'|(?:19|20)\d{2})$', re.I)
+    # Templates vary in where the pivot header sits. Find the real header
+    # row by looking for 'Row Labels' in column A within the first 10 rows:
+    #   Ahmed:    row 3 = 'Sum of ...', row 4 = 'Row Labels' + years, cats 5+
+    #   Chido:    row 2 = 'Sum of ...', row 3 = 'Row Labels' + years, cats 4+
+    #   Kristaps: row 3 = 'Row Labels' + 'Sum of Net' (condensed),  cats 4+
+    header_r = None
+    caption_r = None
+    for r in range(1, 11):
+        v = str(ws_a.cell(r, 1).value or '').strip().lower()
+        if v == 'row labels' and header_r is None:
+            header_r = r
+        if v.startswith('sum of') and caption_r is None:
+            caption_r = r
+    condensed = False
+    if header_r is None:
+        header_r = (caption_r or 3) + 1
+    elif caption_r is None or caption_r == header_r:
+        condensed = True
+        caption_r = header_r
+    if caption_r is None:
+        caption_r = max(1, header_r - 1)
+    first_cat_r = header_r + 1
+
     old_year_cols = []          # (col, value) of existing year headers
     for c in range(2, ws_a.max_column + 1):
-        v = ws_a.cell(4, c).value
-        if v is not None and str(v).strip() in known:
-            old_year_cols.append((c, v))
+        v = ws_a.cell(header_r, c).value
+        if v is None or isinstance(v, float) or not (
+                str(v).strip() in known or year_like.match(str(v).strip())):
+            break
+        old_year_cols.append((c, v))
     years = []
     for _, v in old_year_cols:
         if str(v).strip() not in {str(y).strip() for y in years}:
@@ -703,13 +1160,15 @@ def _update_analysis(ws_a, raw_ws, year_col, net_col, uc_col, last_data_row) -> 
     # own SUMIFS from an earlier run, down to the old 'Grand Total' row.
     grid_cols = max([c for c, _ in old_year_cols] + [1])
     sig = f"=SUMIFS('{raw_name}'!"
-    for c in range(2, ws_a.max_column + 1):
-        if str(ws_a.cell(5, c).value or '').startswith(sig):
-            grid_cols = max(grid_cols, c)
-    if (str(ws_a.cell(4, grid_cols + 1).value or '').strip().lower() == 'grand total'):
+    for c in range(grid_cols + 1, ws_a.max_column + 1):
+        if not str(ws_a.cell(first_cat_r, c).value or '').startswith(sig):
+            break
+        grid_cols = c
+    if (str(ws_a.cell(header_r, grid_cols + 1).value or '').strip().lower() == 'grand total'):
         grid_cols += 1          # a pivot-style 'Grand Total' column
-    grid_bottom = 4
-    for r in range(5, ws_a.max_row + 1):
+
+    grid_bottom = header_r
+    for r in range(first_cat_r, ws_a.max_row + 1):
         v = ws_a.cell(r, 1).value
         if v in (None, ''):
             break
@@ -721,12 +1180,17 @@ def _update_analysis(ws_a, raw_ws, year_col, net_col, uc_col, last_data_row) -> 
     # the next column (e.g. 'PL' / 'BS' feeding their own SUMIFs), and
     # re-sorting would leave every tag against the wrong category. New
     # categories go at the bottom.
+    # Labels are written back exactly as they were: SUMIFS matches text
+    # exactly, so 'Professional fee' would miss RAW rows saying
+    # 'Professional fee ' (trailing space) and drop them from the totals.
     old_cats = []
-    for r in range(5, grid_bottom + 1):
+    for r in range(first_cat_r, grid_bottom + 1):
         v = ws_a.cell(r, 1).value
         if v not in (None, '') and str(v).strip().lower() != 'grand total':
-            old_cats.append(str(v).strip())
-    cats = old_cats + sorted((c for c in data_cats if c not in old_cats), key=str.lower)         if old_cats else sorted(data_cats, key=str.lower)
+            old_cats.append(v)
+    old_keys = {str(c).strip() for c in old_cats}
+    cats = (old_cats + sorted((c for c in data_cats if c.strip() not in old_keys), key=str.lower)
+            if old_cats else sorted(data_cats, key=str.lower))
 
     # A new year (e.g. FY26) becomes a grid column only if those columns are
     # free. If the accountant uses them, the new year is left to the
@@ -735,7 +1199,7 @@ def _update_analysis(ws_a, raw_ws, year_col, net_col, uc_col, last_data_row) -> 
         first_new_col = 2 + len(years)
         need = range(first_new_col, first_new_col + len(added))
         busy = [f"{get_column_letter(c)}{r}" for c in need if c > grid_cols
-                for r in range(3, 6 + len(cats)) if ws_a.cell(r, c).value not in (None, '')]
+                for r in range(3, first_cat_r + len(cats) + 1) if ws_a.cell(r, c).value not in (None, '')]
         if busy:
             print(f"  [excel_writer] Analysis: year(s) {added} not added as grid columns — "
                   f"cells {busy[:3]} are in use; they appear in the PivotTable instead.")
@@ -744,30 +1208,55 @@ def _update_analysis(ws_a, raw_ws, year_col, net_col, uc_col, last_data_row) -> 
             print(f"  [excel_writer] Analysis: added year column(s) {added}")
 
     # style models taken from the existing populated area
-    hdr_style = copy(ws_a.cell(4, 2)._style)
-    cat_style = copy(ws_a.cell(5, 1)._style)
-    val_style = copy(ws_a.cell(5, 2)._style)
+    hdr_style = copy(ws_a.cell(header_r, 2)._style)
+    cat_style = copy(ws_a.cell(first_cat_r, 1)._style)
+    val_style = copy(ws_a.cell(first_cat_r, 2)._style)
+
+    caption = ws_a.cell(caption_r, 1).value or ('Row Labels' if condensed else 'Sum of NET')
+    caption_b = ws_a.cell(caption_r, 2).value
+    label_a = ws_a.cell(header_r, 1).value or 'Row Labels'
 
     # clear the old grid's values but keep every cell's formatting
-    for r in range(3, grid_bottom + 1):
+    clear_from = caption_r
+    for r in range(clear_from, grid_bottom + 1):
         for c in range(1, grid_cols + 1):
             ws_a.cell(r, c).value = None
 
-    ws_a.cell(3, 1, 'Sum of NET')
-    ws_a.cell(3, 2, 'Column Labels')
-    ws_a.cell(4, 1, 'Row Labels')
-    for j, yr in enumerate(years):
-        cell = ws_a.cell(4, 2 + j)
-        cell.value = yr
-        cell._style = copy(hdr_style)
+    ws_a.cell(caption_r, 1, caption)
+    if condensed:
+        # single-row header: keep whatever the sum caption was (e.g. 'Sum of Net')
+        if caption_b is not None:
+            ws_a.cell(caption_r, 2, caption_b)
+    else:
+        if caption_b is not None:
+            ws_a.cell(caption_r, 2, caption_b)
+        else:
+            ws_a.cell(caption_r, 2, 'Column Labels')
+        ws_a.cell(header_r, 1, label_a)
+        for j, yr in enumerate(years):
+            cell = ws_a.cell(header_r, 2 + j)
+            cell.value = yr
+            cell._style = copy(hdr_style)
 
     for k, cat in enumerate(cats):
-        r = 5 + k
+        r = first_cat_r + k
         cell = ws_a.cell(r, 1)
         cell.value = cat
         cell._style = copy(cat_style)
+        if condensed and not years:
+            # Single 'Sum of Net' column with no year axis — SUMIF total.
+            # Essential: the pivot was moved out of A:B when it clashed with
+            # the accountant's PL/BS summary, so these cells would freeze on
+            # their old pivot values otherwise.
+            formula = (
+                f"=SUMIF('{raw_name}'!${uc_letter}:${uc_letter},$A{r},"
+                f"'{raw_name}'!${net_letter}:${net_letter})"
+            )
+            cell = ws_a.cell(r, 2)
+            cell.value = formula
+            cell._style = copy(val_style)
         for j, yr in enumerate(years):
-            yr_ref = f"${get_column_letter(2 + j)}$4"
+            yr_ref = f"${get_column_letter(2 + j)}${header_r}"
             formula = (
                 f"=SUMIFS('{raw_name}'!${net_letter}:${net_letter},"
                 f"'{raw_name}'!${year_letter}:${year_letter},{yr_ref},"
@@ -777,12 +1266,13 @@ def _update_analysis(ws_a, raw_ws, year_col, net_col, uc_col, last_data_row) -> 
             cell.value = formula
             cell._style = copy(val_style)
 
-    total_r = 5 + len(cats)
+    total_r = first_cat_r + len(cats)
     cell = ws_a.cell(total_r, 1)
     cell.value = 'Grand Total'
     cell._style = copy(cat_style)
-    for j in range(len(years)):
+    total_cols = len(years) if years else (1 if condensed else 0)
+    for j in range(total_cols):
         col_letter = get_column_letter(2 + j)
         cell = ws_a.cell(total_r, 2 + j)
-        cell.value = f"=SUM({col_letter}5:{col_letter}{total_r - 1})"
+        cell.value = f"=SUM({col_letter}{first_cat_r}:{col_letter}{total_r - 1})"
         cell._style = copy(val_style)
