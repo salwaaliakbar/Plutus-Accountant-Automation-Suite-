@@ -24,9 +24,8 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.categorise import _payee_key  # noqa: E402
-from core.excel_writer import (  # noqa: E402
-    CORRECTION_COLS, DESC_COLS, UC_COLS, _col, _read_headers,
-)
+from core.columns import CORRECTION_COLS, resolve_columns  # noqa: E402
+from core.excel_writer import _col, _read_headers  # noqa: E402
 
 # A payee's corrections must agree this often to become a rule.
 MIN_SHARE = 0.6
@@ -56,8 +55,8 @@ def learn(folder: Path) -> tuple[dict, list]:
                 continue
             ws = wb[sheet]
             hdrs = _read_headers(ws)
-            uc_col = _col(hdrs, *UC_COLS)
-            desc_col = _col(hdrs, *DESC_COLS)
+            rc = resolve_columns(ws)
+            uc_col, desc_col = rc['uc'], rc['desc']
             corr_col = _correction_col(ws, hdrs, uc_col) if uc_col else None
             if not (uc_col and desc_col and corr_col):
                 report.append(f"  skipped  {path.name} / {sheet}: no AI category, "

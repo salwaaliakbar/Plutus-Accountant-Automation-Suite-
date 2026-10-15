@@ -24,6 +24,15 @@ _MAX_GROUP_SPAN = timedelta(days=365)
 _BOUNDARY_TOLERANCE = 14
 
 
+# '24/25', '2024/25', 'SA24/25', 'SA25': the UK tax year, which starts 6 April
+_TAX_LABEL = re.compile(r'^(?:SA\s*)?\d{2}(?:\d{2})?\s*/\s*\d{2}(?:\d{2})?$|^SA\s*\d{2,4}$', re.I)
+
+
+def _looks_like_tax_year(labels) -> bool:
+    keys = [str(k).strip() for k in labels]
+    return bool(keys) and sum(1 for k in keys if _TAX_LABEL.match(k)) * 2 > len(keys)
+
+
 def _doy(month: int, day: int) -> int:
     """Day-of-year on a fixed non-leap calendar (for circular comparisons)."""
     return date(2001, month, day).timetuple().tm_yday
@@ -103,6 +112,28 @@ class YearLabeller:
             if tax_year and self._fits_boundary((4, 6)):
                 self.boundary = (4, 6)
 
+            # The same snap for any column whose labels look like tax years
+            # ('24/25', 'SA25'), even when older rows are messy (Howayda's
+            # '24/25' runs Aug 2023 - Apr 2025, which _fits_boundary rejects):
+            # if the latest year-to-year gap contains 6 April and the new
+            # year's first row is within a fortnight after it, the client
+            # switched at 6 April — the first transaction just came later.
+            if self.boundary != (4, 6) and (tax_year or _looks_like_tax_year(self.groups)):
+                hi = self.anchor['min']
+                apr6 = date(hi.year, 4, 6)
+                if 0 <= (hi - apr6).days <= _BOUNDARY_TOLERANCE:
+                    self.boundary = (4, 6)
+
+            # A company year's first transaction rarely lands on the 1st: with
+            # one year of history starting on the 2nd-7th, the year started on
+            # the 1st of that month (Shaifa: rows from 2 Mar 2024, year 1 Mar -
+            # 28 Feb; the 1 Mar 2025 row must open the new year). April is
+            # left alone when the day could equally mean the 6 April tax year.
+            m, dday = self.boundary
+            if (not refined and 2 <= dday <= 7 and not (m == 4 and dday >= 6)
+                    and not (tax_year or _looks_like_tax_year(self.groups))):
+                self.boundary = (m, 1)
+
     def _fits_boundary(self, boundary) -> bool:
         """True when, with this year start, every label's rows fall in one
         year and different labels fall in different years."""
@@ -149,7 +180,12 @@ class YearLabeller:
             return (4, 6)
         firsts = [md for md in best if md[1] == 1]
         if not firsts:
-            return None
+            # No month start inside the gap: a row still carrying the old
+            # label sits just after the 1st (a straggler) and the new year's
+            # first transaction came a few days later. A year beginning on
+            # the 3rd of a month is not plausible; the 1st of that month is.
+            lo, hi = gaps[-1]
+            return (hi.month, 1) if hi.day <= 7 else None
         # several month starts fit (one wide gap): take the first one after
         # the previous year's last row, i.e. the year ended in that month
         lo = gaps[-1][0]

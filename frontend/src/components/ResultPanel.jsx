@@ -52,7 +52,7 @@ export default function ResultPanel({ job }) {
         </div>
         <div className="rounded-xl bg-slate-800/60 border border-slate-700 p-4 text-center">
           <p className="text-2xl font-bold text-white">
-            {job.top_categories ? Object.keys(job.top_categories).length : '—'}
+            {job.category_count ?? (job.top_categories ? Object.keys(job.top_categories).length : '—')}
           </p>
           <p className="text-slate-400 text-xs mt-0.5">Categories used</p>
         </div>
@@ -63,7 +63,7 @@ export default function ResultPanel({ job }) {
         <div className="space-y-2">
           <div className="flex items-center gap-1.5 text-slate-400 text-xs font-medium">
             <Tag className="w-3 h-3" />
-            <span>Top categories</span>
+            <span>Categories</span>
           </div>
           <div className="flex flex-wrap gap-2">
             {Object.entries(job.top_categories).map(([cat, count]) => (
@@ -76,6 +76,17 @@ export default function ResultPanel({ job }) {
               </span>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Things the accountant should know about the template */}
+      {(job.template_warnings?.length > 0 || job.balance_problems?.length > 0) && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 space-y-1.5">
+          <p className="text-amber-300 text-xs font-semibold">Please check</p>
+          <ul className="list-disc pl-4 space-y-1 text-amber-200/90 text-xs max-h-40 overflow-y-auto">
+            {(job.template_warnings || []).map((w, i) => <li key={`t${i}`}>{w}</li>)}
+            {(job.balance_problems || []).map((w, i) => <li key={`b${i}`}>{w}</li>)}
+          </ul>
         </div>
       )}
 

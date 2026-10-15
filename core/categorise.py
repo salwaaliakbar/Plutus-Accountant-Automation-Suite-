@@ -107,24 +107,53 @@ def _scrub(text) -> str:
 _STOP = {'CARD', 'PAYMENT', 'TO', 'ON', 'DIRECT', 'DEBIT', 'CREDIT', 'AUTOMATED',
          'ONLINE', 'TRANSACTION', 'VIA', 'MOBILE', 'FP', 'THE', 'REF', 'BGC',
          'TFR', 'DD', 'SO', 'FASTER', 'INWARD', 'OUTWARD', 'BACS', 'RECEIVED',
-         'TRANSFER', 'PYMT', 'IN', 'OUT', 'LVP'}
+         'TRANSFER', 'PYMT', 'IN', 'OUT', 'LVP', 'CD', 'POS', 'DPC', 'GB', 'GBR'}
+
+# Card payments are printed '4445 09MAY23 CD , MCDONALDS 1194 , FROME GB':
+# the date and card digits change every time, and left in they turn one
+# payee into a new 'payee' each month (so history never matched it).
+_EMBEDDED_DATE = re.compile(
+    r'\b\d{1,2}\s?(?:JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|SEPT|'
+    r'OCTOBER|NOVEMBER|DECEMBER|JAN|FEB|MAR|APR|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(?![A-Z])'
+    r'\s?\d{2,4}\b')     # '11 JUNCTION 32' is not a date
+
+
+def _payee_text(t: dict) -> str:
+    """Who was paid: the statement's own payee column (Monzo 'Name') plus the
+    description — Monzo's description is often just a code like
+    'Q53133604629274491' that says nothing about the merchant."""
+    desc = str(t.get('description') or '')
+    payee = str(t.get('payee') or '').strip()
+    if payee and payee.lower() not in desc.lower():
+        return f'{payee} {desc}'.strip()
+    return desc
 
 
 def _payee_key(desc: str) -> str:
     s = str(desc).upper()
-    s = re.sub(r'\d+', ' ', s)
-    s = re.sub(r'[^A-Z& ]+', ' ', s)
-    words = [w for w in s.split() if len(w) > 1 and w not in _STOP]
+    s = _EMBEDDED_DATE.sub(' ', s)
+    s = re.sub(r'\d{3,}', ' ', s)           # card digits, IDs, store numbers
+    s = re.sub(r'[^A-Z0-9& ]+', ' ', s)     # keeps 'O2', 'B7'; drops punctuation
+    words = [w for w in s.split() if len(w) > 1 and not w.isdigit() and w not in _STOP]
     return ' '.join(words[:4])
+
+
+# Shortest payee key that can be trusted: 'BP', 'EE' and 'O2' are real payees.
+_MIN_KEY = 2
 
 
 def _load_learned() -> dict:
     if _LEARNED_PATH.exists():
         try:
             with open(_LEARNED_PATH, encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
         except Exception:
-            pass
+            return {}
+        for key, info in list(data.items()):
+            fresh = _payee_key(info.get('example', ''))
+            if fresh and fresh not in data:
+                data[fresh] = info
+        return data
     return {}
 
 
@@ -143,8 +172,10 @@ def _build_examples(client_examples: list | None) -> tuple[list, list]:
 
     # 1. Client's own template rows (authoritative for THIS client)
     for ex in (client_examples or []):
-        cat = str(ex.get('category') or '').strip()
-        desc = str(ex.get('description') or '').strip()
+        # 'Food?' is the accountant's "probably Food, check it" — the
+        # category offered to the AI is Food, never the question mark
+        cat = str(ex.get('category') or '').strip().rstrip('?').strip()
+        desc = _payee_text(ex).strip()
         if not cat or not desc or cat.startswith('='):
             continue
         if cat not in client_cats:
@@ -161,6 +192,7 @@ def _build_examples(client_examples: list | None) -> tuple[list, list]:
 
     # 2. Global corrections from past accountant feedback
     for key, info in _load_learned().items():
+        key = _payee_key(info.get('example', '')) or key
         if key in seen_keys:
             continue
         seen_keys[key] = True
@@ -228,6 +260,33 @@ def _make_canonicaliser(client_cats: list, analysis_vocab: list | None = None):
     return canon
 
 
+# ── HMRC: the payment reference says which tax it is ──────────────────────────
+
+_HMRC_PAYEE = re.compile(r'\bHMRC\b|\bH\.?\s?M\.?\s?REVENUE\b|REVENUE\s*&\s*CUSTOMS', re.I)
+_HMRC_REFS = (
+    # PAYE / NIC accounts-office reference: 123PA12345678, optionally + period digits
+    ('HMRC-PAYE', re.compile(r'\b\d{3}P[A-Z]\d{8}\d{0,4}\b', re.I)),
+    # Corporation Tax: 10-digit UTR + A001 + 01 + letter (4608109978A00101A)
+    ('HMRC-CT',   re.compile(r'\b\d{10}A\d{5}[A-Z]\b', re.I)),
+    # Self Assessment: 10-digit UTR + K
+    ('HMRC-SA',   re.compile(r'\b\d{10}K\b', re.I)),
+)
+
+
+def _hmrc_by_reference(t: dict):
+    """HMRC-PAYE / HMRC-CT / HMRC-SA when this is a payment to HMRC whose
+    reference has that tax's format, else None (the AI decides)."""
+    if t.get('money_out', 0) <= 0:
+        return None
+    text = f"{t.get('description', '')} {t.get('reference', '')}"
+    if not _HMRC_PAYEE.search(text):
+        return None
+    for category, rx in _HMRC_REFS:
+        if rx.search(text):
+            return category
+    return None
+
+
 # ── Reuse the accountant's own past decisions ─────────────────────────────────
 
 def _direction(t: dict) -> str:
@@ -239,19 +298,26 @@ def _history_rules(client_examples: list | None) -> tuple[dict, set]:
     is clear. Returns ({(payee_key, direction): category}, ambiguous_keys).
     Rows whose direction is unknown are stored under direction None."""
     votes: dict[tuple, dict] = {}
+    queried: dict[tuple, int] = {}     # rows the accountant marked 'Food?'
     for ex in client_examples or []:
-        cat = str(ex.get('category') or '').strip()
-        key = _payee_key(ex.get('description') or '')
-        if not cat or cat.startswith('=') or len(key) < 3:
+        raw_cat = str(ex.get('category') or '').strip()
+        cat = raw_cat.rstrip('?').strip()
+        key = _payee_key(_payee_text(ex))
+        if not cat or cat.startswith('=') or len(key) < _MIN_KEY:
             continue
         slot = votes.setdefault((key, ex.get('direction')), {})
         slot[cat] = slot.get(cat, 0) + 1
+        if raw_cat.endswith('?'):
+            queried[(key, ex.get('direction'))] = queried.get((key, ex.get('direction')), 0) + 1
 
     rules, ambiguous = {}, set()
     for k, counts in votes.items():
         top = max(counts, key=counts.get)
-        if counts[top] / sum(counts.values()) >= _HISTORY_MIN_SHARE:
-            rules[k] = top
+        total = sum(counts.values())
+        if counts[top] / total >= _HISTORY_MIN_SHARE:
+            # the accountant was unsure about most of this payee's rows:
+            # pass the question mark on so the new row is reviewed too
+            rules[k] = top + '?' if queried.get(k, 0) * 2 >= total else top
         else:
             ambiguous.add(k[0])
     return rules, ambiguous
@@ -259,8 +325,8 @@ def _history_rules(client_examples: list | None) -> tuple[dict, set]:
 
 def _rule_for(t: dict, rules: dict, ambiguous: set, learned: dict):
     """(category, source) from past decisions, or (None, None) to ask the AI."""
-    key = _payee_key(t.get('description') or '')
-    if len(key) < 3:
+    key = _payee_key(_payee_text(t))
+    if len(key) < _MIN_KEY:
         return None, None
     d = _direction(t)
     for k in ((key, d), (key, None)):
@@ -357,14 +423,14 @@ def _fill_unknown_from_same_payee(transactions, results) -> list[int]:
     review)."""
     seen: dict[tuple, set] = {}
     for t, c in zip(transactions, results):
-        key = _payee_key(t.get('description') or '')
+        key = _payee_key(_payee_text(t))
         if len(key) >= 3 and c != 'Unknown':
             seen.setdefault((key, _direction(t)), set()).add(c)
     changed = []
     for i, t in enumerate(transactions):
         if results[i] != 'Unknown':
             continue
-        cats = seen.get((_payee_key(t.get('description') or ''), _direction(t)))
+        cats = seen.get((_payee_key(_payee_text(t)), _direction(t)))
         if cats and len(cats) == 1:
             results[i] = next(iter(cats))
             changed.append(i)
@@ -376,6 +442,7 @@ def _fill_unknown_from_same_payee(transactions, results) -> list[int]:
 def _cache_key(t: dict) -> tuple:
     return (
         str(t.get('description', '')).upper(),
+        str(t.get('payee', '')).upper(),
         str(t.get('reference', '')).upper(),
         _direction(t),
     )
@@ -417,7 +484,11 @@ Domain knowledge:
   distinguish salary (regular, fixed, often ref 'Salary') from dividends
   (ref 'Dividend' or irregular round amounts) from DLA (Directors Loan Account).
 - HMRC payments: use the reference to pick HMRC-PAYE / HMRC-VAT / HMRC-CT /
-  HMRC-SA. Plain 'HMRC' only when the reference gives no clue.
+  HMRC-SA. Plain 'HMRC' only when the reference gives no clue. Reference
+  formats: 3 digits + 'P' + a letter + 8 digits (e.g. 120PP03437584, often
+  followed by period digits) = PAYE/NIC; 10 digits + 'A001' + 2 digits + a
+  letter (e.g. 4608109978A00101A) = Corporation Tax; 10 digits + 'K'
+  (e.g. 7964830073K) = Self Assessment; a 9-digit VAT number or 'VAT' = VAT.
 - Credits from opticians chains (Specsavers, Vision Express, Boots Opticians),
   NHS/PCSE, or locum agencies are 'Income'.
 - Petrol stations (Shell, BP, Esso, Texaco, Rontec, MFG, Sainsburys Petrol,
@@ -450,6 +521,9 @@ def _batch_classify(transactions: list[dict], system_prompt: str) -> list[tuple[
             f"date: {d}",
             f"desc: {_scrub(t.get('description', ''))}",
         ]
+        payee = str(t.get('payee') or '').strip()
+        if payee and payee.lower() not in str(t.get('description', '')).lower():
+            parts.insert(1, f"payee: {_scrub(payee)}")
         if t.get('subcategory'):
             parts.append(f"type: {t['subcategory']}")
         if t.get('reference'):
@@ -535,14 +609,21 @@ def categorise_detailed(
     sure: list = [True] * n
     sources: list = ['ai'] * n
 
-    # 1. the accountant's own past decisions
+    # 1. the accountant's own past decisions for this client; then the HMRC
+    #    payment reference; then corrections learned from other files
     for i, t in enumerate(transactions):
         cat, src = _rule_for(t, rules, ambiguous, learned)
+        if src != 'history':
+            ref_cat = _hmrc_by_reference(t)
+            if ref_cat:
+                cat, src = ref_cat, 'reference'
         if cat:
             results[i], sources[i] = cat, src
     n_hist, n_learn = sources.count('history'), sources.count('learned')
+    n_ref = sources.count('reference')
     print(f"  [categorise] {n_hist} from client history, {n_learn} from learned "
-          f"corrections, {n - n_hist - n_learn} left for the AI")
+          f"corrections, {n_ref} from HMRC references, "
+          f"{n - n_hist - n_learn - n_ref} left for the AI")
 
     # 2. the AI for the rest. Identical transactions are asked about once, so
     # duplicates split across batches can't get different answers.
@@ -571,6 +652,14 @@ def categorise_detailed(
             for i in key_to_indices[k]:
                 results[i], sure[i] = cat, is_sure
 
+    # 'Food?' — the accountant's (or the AI's) "probably Food, check it": the
+    # category written is Food, and the row is marked for review.
+    queried = [False] * n
+    for i, c in enumerate(results):
+        if isinstance(c, str) and c.strip().endswith('?'):
+            results[i] = c.strip().rstrip('?').strip() or 'Unknown'
+            queried[i] = True
+
     # 3. one spelling per meaning, then one answer per person + purpose
     results = [canon(c) for c in results]
     changed = _harmonise_people(transactions, results, sources, client_cats)
@@ -582,8 +671,8 @@ def categorise_detailed(
     if filled:
         print(f"  [categorise] {len(filled)} 'Unknown' row(s) given their payee's category")
 
-    review = [src == 'ai' and (not s or c == 'Unknown')
-              for c, s, src in zip(results, sure, sources)]
+    review = [(src == 'ai' and (not s or c == 'Unknown')) or q
+              for c, s, src, q in zip(results, sure, sources, queried)]
     return results, review
 
 

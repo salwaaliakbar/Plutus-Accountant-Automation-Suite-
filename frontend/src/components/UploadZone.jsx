@@ -7,8 +7,8 @@ export default function UploadZone({ onFile }) {
 
   const validate = (file) => {
     const ext = file.name.split('.').pop().toLowerCase()
-    if (!['csv', 'pdf', 'xlsx'].includes(ext)) {
-      alert('Please upload a CSV, PDF or XLSX file.')
+    if (!['csv', 'pdf', 'xlsx', 'xls'].includes(ext)) {
+      alert('Please upload a CSV, PDF, XLSX or XLS file.')
       return false
     }
     return true
@@ -43,7 +43,7 @@ export default function UploadZone({ onFile }) {
       <input
         ref={inputRef}
         type="file"
-        accept=".csv,.pdf,.xlsx"
+        accept=".csv,.pdf,.xlsx,.xls"
         className="hidden"
         onChange={handleChange}
       />

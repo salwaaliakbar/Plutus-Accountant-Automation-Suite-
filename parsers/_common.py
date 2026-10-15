@@ -15,10 +15,22 @@ import re
 from datetime import date, datetime, timedelta
 
 
+def _fix_mojibake(s: str) -> str:
+    """'CaffÃ¨ Nero' -> 'Caffè Nero': UTF-8 text that was opened as Windows-1252
+    somewhere on its way into the spreadsheet. Left alone if it doesn't
+    round-trip cleanly."""
+    if 'Ã' not in s and 'Â' not in s:
+        return s
+    try:
+        return s.encode('cp1252').decode('utf-8')
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+
+
 def clean(raw) -> str:
     if raw is None:
         return ''
-    return re.sub(r'\s{2,}', ' ', str(raw).replace('\t', ' ')).strip()
+    return re.sub(r'\s{2,}', ' ', _fix_mojibake(str(raw)).replace('\t', ' ')).strip()
 
 
 def cell_str(val) -> str:
@@ -94,6 +106,67 @@ def parse_datetime(raw):
     return None
 
 
+def _swap_day_month(v):
+    """A date/datetime with day and month exchanged, or None when that is
+    not possible or would change nothing (day > 12, or day == month)."""
+    if not isinstance(v, (date, datetime)) or v.day > 12 or v.day == v.month:
+        return None
+    try:
+        return v.replace(month=v.day, day=v.month)
+    except ValueError:
+        return None
+
+
+def _disorder(dates: list) -> int:
+    """How far a sequence is from sorted in either direction (a statement is
+    either oldest-first or newest-first): the smaller count of out-of-order
+    steps."""
+    down = sum(1 for a, b in zip(dates, dates[1:]) if a > b)
+    up = sum(1 for a, b in zip(dates, dates[1:]) if a < b)
+    return min(down, up)
+
+
+def fix_swapped_dates(rows: list, date_col) -> int:
+    """Repair spreadsheets whose dates had day and month swapped.
+
+    Open a day-first CSV (02/03/2025) in a US-locale Excel and every date
+    with a day of 12 or less becomes a real date with day and month
+    exchanged (3 Feb 2025), while 13/03/2025 stays correct text — so one
+    file mixes both. The statement's own order shows it: swapping the
+    suspect cells back must make the dates run in order, and it is done only
+    when that clearly does. Returns how many cells were corrected."""
+    if not date_col:
+        return 0
+    original, swapped, candidates = [], [], 0
+    for row in rows:
+        v = row.get(date_col)
+        dt = parse_datetime(v) if v not in (None, '') else None
+        if dt is None:
+            continue
+        alt = _swap_day_month(v) if isinstance(v, (date, datetime)) else None
+        candidates += alt is not None
+        original.append(dt)
+        swapped.append(parse_datetime(alt) if alt is not None else dt)
+    if not candidates or len(original) < 4:
+        return 0
+    bad_before, bad_after = _disorder(original), _disorder(swapped)
+    clearly_better = bad_before >= 2 and bad_after * 2 <= bad_before
+    # a short statement crossing one month end may show only one break, but
+    # swapping back makes it perfectly ordered
+    perfect_after = candidates >= 2 and bad_after == 0 and bad_before > 0
+    if not (clearly_better or perfect_after):
+        return 0
+    fixed = 0
+    for row in rows:
+        alt = _swap_day_month(row.get(date_col))
+        if alt is not None:
+            row[date_col] = alt
+            fixed += 1
+    print(f"  [parse] Corrected {fixed} date(s) saved with day and month swapped "
+          f"(the dates only run in order once swapped back)")
+    return fixed
+
+
 def norm_header(h) -> str:
     """'Paid In (£)' / ' Paid in ' / 'Amount (GBP)' -> comparable key."""
     s = str(h).lower().replace('£', ' ')
@@ -125,6 +198,8 @@ DESC_HEADERS = ('Memo', 'Counter Party', 'Counterparty', 'Description',
                 'Transaction description', 'Transaction Details', 'Details',
                 'Narrative', 'Particulars', 'Payee', 'Payee Name', 'Name',
                 'Merchant', 'Merchant Name', 'Beneficiary', 'Transaction')
+NAME_HEADERS = ('Name', 'Payee', 'Payee Name', 'Merchant', 'Merchant Name',
+                'Counter Party', 'Counterparty')
 REF_HEADERS  = ('Reference', 'Ref', 'Payment Reference', 'Transaction ID', 'Notes')
 TYPE_HEADERS = ('Type', 'Transaction Type', 'Payment Type')
 CAT_HEADERS  = ('Spending Category', 'Category name', 'Category')
@@ -220,6 +295,12 @@ def parse_rows(rows: list, headers: list) -> list:
     in_col      = find_col(headers, *IN_HEADERS)
     out_col     = find_col(headers, *OUT_HEADERS)
     amt_col     = find_col(headers, *AMT_HEADERS)
+    # Monzo-style exports carry the merchant in 'Name' and the raw card text
+    # (or just a reference code) in 'Description': keep the payee separately
+    # so categorisation can see who was actually paid.
+    name_col    = find_col(headers, *NAME_HEADERS)
+    if name_col == desc_col:
+        name_col = None
     time_col    = find_col(headers, 'Time')
     from_col    = find_col(headers, 'From')
     to_col      = find_col(headers, 'To')
@@ -238,7 +319,7 @@ def parse_rows(rows: list, headers: list) -> list:
         if desc_col:
             print(f"  [parse] No description header recognised — using column '{desc_col}'")
 
-    used = {c for c in (date_col, desc_col, ref_col, type_col, csv_cat_col, bal_col,
+    used = {c for c in (date_col, desc_col, name_col, ref_col, type_col, csv_cat_col, bal_col,
                         in_col, out_col, amt_col, time_col, from_col, to_col,
                         status_col, tag_col) if c}
     extra_cols = [h for h in headers if h not in used]
@@ -294,6 +375,7 @@ def parse_rows(rows: list, headers: list) -> list:
             'date':         d,
             'timestamp':    timestamp,
             'description':  description,
+            'payee':        clean(row.get(name_col)) if name_col else '',
             'subcategory':  subcategory,
             'reference':    reference,
             'csv_category': csv_category,
@@ -305,6 +387,11 @@ def parse_rows(rows: list, headers: list) -> list:
             'status':       cell_str(row.get(status_col)) if status_col else '',
             'tag':          cell_str(row.get(tag_col))    if tag_col    else '',
             'extra':        {h: row.get(h) for h in extra_cols
+                             if row.get(h) not in (None, '')},
+            # every column of the statement row as it came, so the writer can
+            # fill ANY template column whose header matches (Transaction ID,
+            # Time, Category, …) whatever the parser called it
+            'raw':          {h: row.get(h) for h in headers
                              if row.get(h) not in (None, '')},
         })
 
@@ -336,15 +423,25 @@ def salvage_json_array(text: str):
 
     Returns the parsed list, or None if nothing could be recovered.
     """
-    start = text.find('[')
+    # raw_decode stops at the end of the array, so a closing ``` code fence
+    # or a trailing sentence after a complete array does not count as damage
+    # (it used to, and cost the last answer). The answer array is the first
+    # '[' that decodes to a non-empty list — not a '[1]' in surrounding prose.
+    decoder = json.JSONDecoder()
+    for m in re.finditer(r'\[', text):
+        try:
+            value = decoder.raw_decode(text[m.start():])[0]
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, list) and value and all(isinstance(v, (dict, str)) for v in value):
+            return value
+
+    start = text.find('[{')
+    if start == -1:
+        start = text.find('[')
     if start == -1:
         return None
     body = text[start:]
-
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError:
-        pass
 
     depth = 0
     in_str = False

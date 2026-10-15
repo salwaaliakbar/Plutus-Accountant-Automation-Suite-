@@ -122,13 +122,13 @@ export default function UploadPage() {
         <div className="space-y-3">
           <FilePicker
             label="Bank Statement"
-            accept=".csv,.pdf,.xlsx"
+            accept=".csv,.pdf,.xlsx,.xls"
             icon={FileText}
             iconColor="text-sky-400"
             file={statementFile}
             onFile={setStatementFile}
             onClear={() => setStatementFile(null)}
-            hint="CSV, PDF or XLSX"
+            hint="CSV, PDF, XLSX or XLS"
           />
           <FilePicker
             label="Excel Template Workbook"

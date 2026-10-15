@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest
+xlwt        # builds a legacy .xls fixture for the parser tests
+reportlab   # builds text and image-only PDF fixtures
+httpx       # FastAPI test client

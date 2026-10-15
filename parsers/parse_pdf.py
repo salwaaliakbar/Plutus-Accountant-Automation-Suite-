@@ -542,8 +542,13 @@ def _detect_header(lines: list):
                 put('out', [words[i]])
             elif t == 'balance':
                 put('balance', [words[i]])
-            elif t == 'amount':
+            elif t == 'value' and nxt == 'date':
+                i += 2          # 'Value Date' is a date column, not the amount
+                continue
+            elif t in ('amount', 'value'):
                 put('amount', [words[i]])
+            elif t == 'category':
+                put('cat', [words[i]])
             elif t == 'type':
                 put('type', [words[i]])
             elif t in _HDR_DESC:
@@ -555,6 +560,12 @@ def _detect_header(lines: list):
         bottom = ln['bottom']
         for other in lines[max(0, idx - 2): idx + 3]:
             if other is ln or abs(other['top'] - ln['top']) > 16:
+                continue
+            # a stacked heading line holds only words — a transaction row
+            # just below the header (date / amounts on it) is not part of it,
+            # or its 'Credit' payment type would be taken for a heading
+            if _layout_date(other['words'], 2000) or any(
+                    _layout_amount(w['text']) for w in other['words']):
                 continue
             for w in other['words']:
                 t = _norm_word(w['text'])
@@ -652,13 +663,15 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
 
     def split_text(r):
         cols_ = r['cols']
-        typ, desc = [], []
+        typ, desc, cat = [], [], []
         for w in r['words']:
-            if 'type' in cols_ and 'desc' in cols_ and cols_['type'][0] - 5 <= w['x0'] < cols_['desc'][0] - 2:
+            if 'cat' in cols_ and w['x0'] >= cols_['cat'][0] - 3:
+                cat.append(w['text'])
+            elif 'type' in cols_ and 'desc' in cols_ and cols_['type'][0] - 5 <= w['x0'] < cols_['desc'][0] - 2:
                 typ.append(w['text'])
             else:
                 desc.append(w['text'])
-        return ' '.join(typ), ' '.join(desc)
+        return ' '.join(typ), ' '.join(desc), ' '.join(cat)
 
     txns, current_date, pending_text, pending_type = [], None, [], []
     last_month, year_bump = None, 0
@@ -688,7 +701,7 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
             continue
         if r['date']:
             current_date = fix_year(r['date'], r['has_year'])
-        typ, desc = split_text(r)
+        typ, desc, cat = split_text(r)
         money = {k: v for k, v in r['amounts'].items() if k != 'balance'}
 
         if money and first_line_mode and lead and not desc and not typ                 and r['top'] < lead['bottom'] + 2:
@@ -699,7 +712,7 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
         if not money:
             if r['date'] and not first_line_mode:
                 pending_text, pending_type = ([desc] if desc else []), ([typ] if typ else [])
-            elif r['date'] is None and (desc or typ):
+            elif r['date'] is None and (desc or typ or cat):
                 is_cont = (r['gap'] is not None and r['gap'] < 12 and not r['stray']
                            and r['x0'] > r['text_left'] + 2)
                 if first_line_mode:
@@ -709,6 +722,8 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
                         lead['bottom'] = r['bottom']
                     elif txns and is_cont:
                         txns[-1]['description'] = (txns[-1]['description'] + ' ' + desc).strip()
+                        if cat:
+                            txns[-1]['csv_category'] = (txns[-1]['csv_category'] + ' ' + cat).strip()
                     elif not r['stray'] and r['x0'] > r['text_left'] + 2:
                         lead = {'desc': desc, 'typ': typ, 'bottom': r['bottom']}
                 elif is_cont or pending_text:
@@ -745,7 +760,8 @@ def _parse_layout(pdf, year_hint: int) -> list[dict]:
         txns.append({
             'date': current_date,
             'description': _scrub(full_desc.strip()),
-            'subcategory': full_type.strip(), 'reference': '', 'csv_category': '',
+            'subcategory': full_type.strip(), 'reference': '',
+            'csv_category': '' if cat.strip().lower() == 'none' else cat.strip(),
             'money_in': round(money_in, 2), 'money_out': round(money_out, 2),
             'balance': balance, '_unsigned': amount_sign == 0,
         })
@@ -1014,7 +1030,124 @@ def _order(txns: list) -> list:
     return sorted(txns, key=lambda t: t['date'])
 
 
-def parse_pdf(path, year_hint: int = None) -> list[dict]:
+def _is_scanned(pdf) -> bool:
+    """True when the PDF has pages but (almost) no text layer — i.e. it is
+    a scan or photo. Checks the first few pages; a statement always has more
+    than a handful of characters of text per page."""
+    pages = pdf.pages[:5]
+    if not pages:
+        return False
+    chars = sum(len((p.extract_text() or '').strip()) for p in pages)
+    return chars < 40 * len(pages)
+
+
+# ── Scanned PDFs (no text layer): Claude reads the page images ────────────────
+
+_SCAN_MESSAGE = (
+    "'{name}' looks like a scanned image — it has no selectable text. {why}"
+    "Please download the statement as a CSV or Excel file from online banking "
+    "instead (most portals offer 'Download transactions'), or a PDF saved "
+    "directly from the bank rather than scanned."
+)
+
+
+def _page_png_b64(page, resolution: int = 130) -> str:
+    import base64
+    import io
+    buf = io.BytesIO()
+    page.to_image(resolution=resolution).original.convert('RGB').save(buf, format='PNG')
+    return base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+def _parse_scanned(pdf, year_hint: int, name: str, pages_per_call: int = 2) -> list[dict]:
+    """Read a scanned / photographed statement with Claude's vision.
+
+    PRIVACY: unlike every other path, this one sends the page IMAGES, which
+    include whatever is printed on them (name, address, account number). It
+    is only used for PDFs that cannot be read any other way, and can be
+    switched off with PLUTUS_SCAN_AI=0. Results are only as good as the scan,
+    so every row is marked from_scan and checked against the printed running
+    balance; the accountant is told to verify the figures.
+    """
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    if os.environ.get('PLUTUS_SCAN_AI', '1').strip().lower() in ('0', 'false', 'no', 'off'):
+        raise ValueError(_SCAN_MESSAGE.format(name=name, why="Reading scans is switched off. "))
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not api_key or api_key.startswith('sk-ant-...'):
+        raise ValueError(_SCAN_MESSAGE.format(
+            name=name, why="Reading scans needs the Anthropic API key, which is not set. "))
+
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+    model = os.environ.get('CATEGORISE_MODEL', 'claude-sonnet-5')
+
+    system = (
+        "You read scanned UK bank statement pages and extract the transaction table. "
+        "Return ONLY a JSON array, one object per transaction row, in the order printed: "
+        '{"date":"YYYY-MM-DD","description":"...","type":"...","reference":"...",'
+        '"money_in":0.0,"money_out":0.0,"balance":null_or_number}. '
+        "Rules: copy every figure exactly as printed — never estimate, round or "
+        "invent. money_in for credits, money_out for debits (positive numbers). "
+        "A date printed without a year belongs to the statement year the user gives. "
+        "balance is the running balance printed on that row, or null if none is printed. "
+        "Skip headers, summaries, opening/closing/brought-forward balances, page "
+        "footers and anything that is not a transaction. Put a wrapped description "
+        "on one line. Leave out account numbers, sort codes and IBANs from the "
+        "description. If a value is unreadable use null for it and keep the row."
+    )
+
+    def to_txn(row):
+        try:
+            d = datetime.strptime(str(row['date']), '%Y-%m-%d').date()
+            money_in = float(row.get('money_in') or 0)
+            money_out = float(row.get('money_out') or 0)
+            bal = row.get('balance')
+            balance = float(bal) if bal is not None else None
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        if money_in <= 0 and money_out <= 0:
+            return None
+        return {
+            'date': d,
+            'description': re.sub(r'\s+', ' ', str(row.get('description') or '')).strip(),
+            'subcategory': str(row.get('type') or '').strip(),
+            'reference': str(row.get('reference') or '').strip(),
+            'csv_category': '',
+            'money_in': round(money_in, 2), 'money_out': round(money_out, 2),
+            'balance': balance, 'from_scan': True,
+        }
+
+    txns = []
+    pages = pdf.pages
+    for start in range(0, len(pages), pages_per_call):
+        content = []
+        for page in pages[start:start + pages_per_call]:
+            content.append({'type': 'image', 'source': {
+                'type': 'base64', 'media_type': 'image/png', 'data': _page_png_b64(page)}})
+        content.append({'type': 'text', 'text': (
+            f"Statement year: {year_hint}. Extract every transaction from these "
+            f"{len(content)} page image(s).")})
+        response = client.messages.create(
+            model=model, max_tokens=16000, system=system,
+            messages=[{'role': 'user', 'content': content}])
+        text = ''.join(b.text for b in response.content
+                       if getattr(b, 'type', '') == 'text').strip()
+        rows = salvage_json_array(text) or []
+        txns += [t for t in (to_txn(r) for r in rows if isinstance(r, dict)) if t]
+
+    if not txns:
+        raise ValueError(_SCAN_MESSAGE.format(
+            name=name, why="No transactions could be read from the page images. "))
+    checked, bad = _reconcile(txns)
+    print(f"  [parse_pdf] Scan read by AI — balance check: {checked - bad}/{checked} rows reconcile")
+    return txns
+
+
+
+def _parse_pdf_raw(path, year_hint: int = None) -> list[dict]:
     """Parse a bank statement PDF and return transactions.
 
     Three layers: Barclays text parser -> generic table parser -> AI extraction.
@@ -1028,6 +1161,12 @@ def parse_pdf(path, year_hint: int = None) -> list[dict]:
         year_hint = _infer_year(path)
 
     with pdfplumber.open(path) as pdf:
+        if _is_scanned(pdf):
+            txns = _parse_scanned(pdf, year_hint, path.name)
+            print(f"  [parse_pdf] Scanned PDF read by AI from page images: "
+                  f"{len(txns)} transactions from {path.name}")
+            return _order(txns)
+
         # Layer 1: Barclays text-mode (only if it actually is a Barclays statement)
         first_text = ' '.join(
             (p.extract_text() or '') for p in pdf.pages[:2]
@@ -1052,7 +1191,10 @@ def parse_pdf(path, year_hint: int = None) -> list[dict]:
                 checked, bad = _reconcile(txns)
                 candidates.append((bad, -len(txns), name, txns, checked))
         if candidates:
-            bad, _, name, txns, checked = min(candidates, key=lambda c: (c[0], c[1]))
+            # best = lowest share of balance mismatches; a parse that found no
+            # balances to check at all (a summary box) does not count as clean
+            bad, _, name, txns, checked = min(
+                candidates, key=lambda c: ((c[0] / c[4]) if c[4] else 0.5, c[1]))
             print(f"  [parse_pdf] {name} parser: {len(txns)} transactions from {path.name} "
                   f"(balance check: {checked - bad}/{checked} rows reconcile)")
             return _order(txns)
@@ -1066,8 +1208,21 @@ def parse_pdf(path, year_hint: int = None) -> list[dict]:
 
     raise ValueError(
         f"Could not read any transactions from '{path.name}'. "
-        "The PDF may be a scanned image (no selectable text). "
+        "The layout is not one the reader recognises. "
         "Please export a CSV from your online banking instead — "
         "most portals offer a 'Download transactions (CSV)' option. "
         f"(Year hint: {year_hint})"
     )
+
+
+def parse_pdf(path, year_hint: int = None) -> list[dict]:
+    """Parse a bank statement PDF (see _parse_pdf_raw for the strategy).
+
+    Text wrapped over several lines in the PDF is joined with single spaces,
+    so a description never reaches the workbook with line breaks in it."""
+    txns = _parse_pdf_raw(path, year_hint)
+    for t in txns:
+        for field in ('description', 'subcategory', 'reference', 'csv_category'):
+            if isinstance(t.get(field), str):
+                t[field] = re.sub(r'\s+', ' ', t[field]).strip()
+    return txns

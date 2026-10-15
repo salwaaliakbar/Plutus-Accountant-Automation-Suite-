@@ -30,6 +30,8 @@ from openpyxl.workbook.properties import CalcProperties
 
 from core.financial_year import get_fy
 from parsers._common import norm_header
+from core.columns import (CORRECTION_COLS, DESC_COLS, IN_COLS, OUT_COLS, UC_COLS,
+                          read_headers, resolve_columns)
 from core.year_labels import YearLabeller, learn_year_columns
 
 
@@ -96,26 +98,11 @@ def _sheet_score(ws, kind: str) -> int:
     return formula_count + (20 if row_count < 100 else 0)
 
 
-def _read_headers(ws) -> dict:
-    row1 = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
-    hdrs = {}
-    for i, v in enumerate(row1):
-        if v is not None and str(v).strip():
-            hdrs.setdefault(norm_header(v), i + 1)
-    return hdrs
+_read_headers = read_headers
 
 
-# Template column names, matched ignoring case / spacing / '(£)' / '(GBP)'.
-DESC_COLS = ('Counter Party', 'Counterparty', 'Description', 'Transaction description',
-             'Transaction Details', 'Details', 'Memo', 'Narrative', 'Particulars',
-             'Payee', 'Name', 'Merchant')
-IN_COLS   = ('Paid in', 'Money in', 'In', 'Credit', 'Credits', 'Receipts', 'Deposits')
-OUT_COLS  = ('Paid out', 'Money out', 'Out', 'Debit', 'Debits', 'Payments',
-             'Withdrawals', 'Withdrawn')
-UC_COLS   = ('UC category', 'UC Category', 'UC')
 # Where the accountant types the right category when the AI's is wrong
 # (read by scripts/learn_from_feedback.py).
-CORRECTION_COLS = ('Correct category', 'Correction', 'Accountant category')
 CORRECTION_HEADER = CORRECTION_COLS[0]
 
 # Rows the AI was unsure about: highlighted on the category cell.
@@ -317,15 +304,12 @@ def extract_client_examples(template_path, sheet_name: str = None) -> list:
     except KeyError:
         return []
     ws = wb[raw_name]
-    hdrs = _read_headers(ws)
-
-    desc_col = _col(hdrs, *DESC_COLS)
-    uc_col   = _col(hdrs, *UC_COLS)
-    ref_col  = _col(hdrs, 'Reference', 'Ref')
-    type_col = _col(hdrs, 'Type', 'Transaction Type', 'Transaction type')
-    in_col   = _col(hdrs, *IN_COLS)
-    out_col  = _col(hdrs, *OUT_COLS)
-    amt_col  = _col(hdrs, 'Amount', 'Value', 'NET', 'Net')
+    rc = resolve_columns(ws)
+    desc_col, uc_col = rc['desc'], rc['uc']
+    ref_col, type_col = rc['ref'], rc['type']
+    in_col, out_col = rc['in'], rc['out']
+    name_col = rc['name']
+    amt_col = rc['amt'] or rc['net']
 
     if not desc_col or not uc_col:
         return []
@@ -347,6 +331,12 @@ def extract_client_examples(template_path, sheet_name: str = None) -> list:
     for r in range(2, ws.max_row + 1):
         desc = ws.cell(r, desc_col).value
         cat  = ws.cell(r, uc_col).value
+        # the reviewer's final answer ('MUC desc') beats the first pass
+        for col in rc['reviewed']:
+            v = ws.cell(r, col).value
+            if v not in (None, '') and not (isinstance(v, str) and v.startswith('=')):
+                cat = v
+                break
         if not desc or not cat:
             continue
         cat = str(cat).strip()
@@ -354,6 +344,7 @@ def extract_client_examples(template_path, sheet_name: str = None) -> list:
             continue
         examples.append({
             'description': str(desc).strip(),
+            'payee':     str(ws.cell(r, name_col).value or '').strip() if name_col else '',
             'type':      str(ws.cell(r, type_col).value or '').strip() if type_col else '',
             'reference': str(ws.cell(r, ref_col).value  or '').strip() if ref_col  else '',
             'category':  cat,
@@ -470,12 +461,11 @@ def drop_rows_already_in_template(transactions: list, template_path,
             else wb[_detect_sheet(wb, 'raw')]
     except KeyError:
         return transactions, 0
-    hdrs = _read_headers(ws)
-    date_col = _col(hdrs, 'Date')
-    desc_col = _col(hdrs, *DESC_COLS)
-    in_col, out_col = _col(hdrs, *IN_COLS), _col(hdrs, *OUT_COLS)
-    amt_col = _col(hdrs, 'Amount', 'Value', 'NET', 'Net')
-    bal_col = _col(hdrs, 'Balance', 'Running Balance')
+    rc = resolve_columns(ws)
+    date_col, desc_col = rc['date'], rc['desc']
+    in_col, out_col = rc['in'], rc['out']
+    amt_col = rc['amt'] or rc['net']
+    bal_col = rc['bal']
     if not date_col:
         return transactions, 0
 
@@ -572,9 +562,13 @@ def write_workbook(
     output_path,
     sheet_name: str = None,
     review: list = None,
-) -> None:
+    warnings: list = None,
+) -> list:
     """review – optional list of bools, one per transaction: True highlights
-    that row's category for the accountant to check."""
+    that row's category for the accountant to check.
+    warnings – optional list that receives plain-English notes about template
+    columns the statement could not fill (shown to the accountant).
+    Returns the balance / integrity problems found."""
     template_path = Path(template_path)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -589,29 +583,17 @@ def write_workbook(
         ws = wb[_detect_sheet(wb, 'raw')]
 
     hdrs = _read_headers(ws)
+    rc = resolve_columns(ws)
 
-    no_col    = _col(hdrs, 'No', '#')
-    sa_col    = _col(hdrs, 'SA')
-    acc_col   = _col(hdrs, 'ACC', 'AC')
-    fy_col    = _col(hdrs, 'FY')
-    date_col  = _col(hdrs, 'Date')
-    desc_col  = _col(hdrs, *DESC_COLS)
-    ref_col   = _col(hdrs, 'Reference', 'Ref')
-    type_col  = _col(hdrs, 'Type', 'Transaction Type', 'Transaction type')
-    in_col    = _col(hdrs, *IN_COLS)
-    out_col   = _col(hdrs, *OUT_COLS)
-    amt_col   = _col(hdrs, 'Amount', 'Value')
-    bal_col   = _col(hdrs, 'Balance', 'Running Balance')
-    net_col   = _col(hdrs, 'NET', 'Net')
-    buc_col   = _col(hdrs, 'Balance UC')
-    chk_col   = _col(hdrs, 'Check UC', 'Check')
-    csv_cat_col = _col(hdrs, 'Spending Category', 'Category name')
-    uc_col    = _col(hdrs, *UC_COLS)
-    ts_col    = _col(hdrs, 'Timestamp')
-    from_col   = _col(hdrs, 'From')
-    to_col     = _col(hdrs, 'To')
-    status_col = _col(hdrs, 'Status')
-    tag_col    = _col(hdrs, 'Tag 1', 'Tag')
+    no_col, sa_col, acc_col, fy_col = rc['no'], rc['sa'], rc['acc'], rc['fy']
+    date_col, desc_col, ref_col, type_col = rc['date'], rc['desc'], rc['ref'], rc['type']
+    in_col, out_col, amt_col, bal_col = rc['in'], rc['out'], rc['amt'], rc['bal']
+    net_col, buc_col, chk_col = rc['net'], rc['buc'], rc['chk']
+    csv_cat_col, uc_col = rc['bank_cat'], rc['uc']
+    ts_col, from_col, to_col = rc['ts'], rc['from'], rc['to']
+    status_col, tag_col = rc['status'], rc['tag']
+    reviewed_cols = rc['reviewed']
+    name_col = rc['name']
 
     # Templates with no Paid in / Paid out and no Amount column keep the
     # signed amount straight in 'Net' as a plain value — write it there.
@@ -662,15 +644,29 @@ def write_workbook(
             model_styles[c] = copy(cell._style)
         # Collect the most recent formula per column, scanning several rows up:
         # some templates carry a formula only on the row-sign it applies to
-        # (e.g. IN = IF(H>0,H,"") appears only on income rows).
+        # (e.g. IN = IF(H>0,H,"") appears only on income rows). A column only
+        # counts as formula-driven when the model row holds a formula or at
+        # least half of its filled cells do — one '=F7' ("same as above") the
+        # accountant once typed in a category cell must not turn every new
+        # category into a formula.
         scan_from = max(2, model_row - 200)
+        n_formula, n_value = {}, {}
         for r_scan in range(model_row, scan_from - 1, -1):
             for c in range(1, max_col + 1):
-                if c in model_formulas:
-                    continue
                 v = ws.cell(r_scan, c).value
+                if v in (None, ''):
+                    continue
                 if isinstance(v, str) and v.startswith('='):
-                    model_formulas[c] = (v, r_scan)
+                    n_formula[c] = n_formula.get(c, 0) + 1
+                    if c not in model_formulas:
+                        model_formulas[c] = (v, r_scan)
+                else:
+                    n_value[c] = n_value.get(c, 0) + 1
+        for c in list(model_formulas):
+            on_model_row = isinstance(ws.cell(model_row, c).value, str) \
+                and ws.cell(model_row, c).value.startswith('=')
+            if not on_model_row and n_formula[c] < n_value.get(c, 0):
+                del model_formulas[c]
         d_model = ws.cell(model_row, date_col).value if date_col else None
         if isinstance(d_model, str):
             date_text_fmt = _detect_text_date_format(d_model)
@@ -733,10 +729,11 @@ def write_workbook(
     mapped = {c for c in (no_col, sa_col, acc_col, fy_col, date_col, desc_col,
                           ref_col, type_col, in_col, out_col, amt_col, bal_col,
                           net_col, buc_col, chk_col, csv_cat_col, uc_col, ts_col,
-                          from_col, to_col, status_col, tag_col) if c}
+                          from_col, to_col, status_col, tag_col, rc['correct'], name_col,
+                          *reviewed_cols) if c}
     passthrough = {}    # normalised header -> template column
     for h, c in hdrs.items():
-        if c not in mapped and c not in model_formulas and not _col({h: c}, *CORRECTION_COLS):
+        if c not in mapped and c not in model_formulas:
             passthrough[h] = c
     numeric_cols = set()
     if model_row:
@@ -751,6 +748,74 @@ def write_workbook(
             if col in numeric_cols and re.fullmatch(r'-?\d[\d,]*(\.\d+)?', v):
                 return float(v.replace(',', ''))
         return v if v not in (None, '') else None
+
+    # PDF statements often lack Type / Name / Category columns that CSV
+    # exports have. For those template columns, reuse what the client's own
+    # rows hold for the same payee — only when that payee repeated the same
+    # value at least twice, so a one-off (an ID, a reference) is never copied.
+    # Only descriptive columns may be filled from history. A 'Checked' /
+    # 'Reviewed' / 'VAT?' tick column must never be copied onto a new row —
+    # that would invent the accountant's sign-off.
+    def _descriptive(h: str) -> bool:
+        if h.endswith('?'):
+            return False
+        return any(w in h for w in ('type', 'categor', 'name', 'payee', 'merchant',
+                                    'class', 'nominal', 'code', 'account', 'dept',
+                                    'department', 'project', 'client', 'supplier',
+                                    'vendor', 'group', 'label'))
+
+    history_cols = [c for c in (type_col, name_col) if c] + [
+        c for h, c in passthrough.items() if _descriptive(h)]
+    hist = {}      # column -> {payee key -> {value: count}}
+    if desc_col and last_row > 1:
+        for r_scan in range(2, last_row + 1):
+            dk = _key(ws.cell(r_scan, desc_col).value)
+            if not dk:
+                continue
+            for c in history_cols:
+                v = ws.cell(r_scan, c).value
+                if isinstance(v, str) and v.strip() and not v.startswith('='):
+                    slot = hist.setdefault(c, {}).setdefault(dk, {})
+                    slot[v] = slot.get(v, 0) + 1
+
+    def learned_value(col, desc):
+        votes = hist.get(col, {}).get(_key(desc))
+        if not votes:
+            return None
+        top = max(votes, key=votes.get)
+        return top if votes[top] >= 2 and votes[top] / sum(votes.values()) >= 0.6 else None
+
+    # The same payment type is spelled differently by each source: the CSV
+    # says 'Faster payment', the PDF 'Faster Payments'; Starling prints
+    # 'DIRECT DEBIT' where a PDF gives 'Direct Debit'; Monzo's CSV has
+    # 'Bacs (Direct Credit)' and its PDF 'Direct Credit'. Use the spelling
+    # the client's own rows already carry for that column.
+    def _vkey(v):
+        k = re.sub(r'[^a-z]+', '', str(v).lower())
+        return k[:-1] if len(k) > 4 and k.endswith('s') else k
+
+    vocab = {}      # column -> {key -> most common existing spelling}
+    for vc in (type_col, csv_cat_col):
+        if not vc:
+            continue
+        counts = {}
+        for r_scan in range(2, last_row + 1):
+            v = ws.cell(r_scan, vc).value
+            if isinstance(v, str) and v.strip() and not v.startswith('='):
+                v = v.strip()
+                keys = {_vkey(v)}
+                inner = re.search(r'\(([^)]+)\)', v)
+                if inner:
+                    keys.add(_vkey(inner.group(1)))      # 'Bacs (Direct Credit)'
+                for k in keys:
+                    counts.setdefault(k, {}).setdefault(v, 0)
+                    counts[k][v] += 1
+        vocab[vc] = {k: max(c, key=c.get) for k, c in counts.items()}
+
+    def in_clients_spelling(col, value):
+        if not value:
+            return value
+        return vocab.get(col, {}).get(_vkey(value), value)
 
     # ── Highest existing sequence number ──────────────────────────────────────
     last_no = 0
@@ -818,14 +883,18 @@ def write_workbook(
                 ws.cell(r, date_col, value=datetime(d.year, d.month, d.day))
 
         w(desc_col, desc or None)
+        w(name_col, (txn.get('payee') or '').strip() or learned_value(name_col, desc))
         w(ref_col,  (txn.get('reference') or '').strip() or None)
-        w(type_col, (txn.get('subcategory') or '').strip() or None)
+        w(type_col, in_clients_spelling(
+            type_col, (txn.get('subcategory') or '').strip() or learned_value(type_col, desc)))
         w(in_col,   money_in  if money_in  > 0 else None)
         w(out_col,  (-money_out if out_negative else money_out) if money_out > 0 else None)
         w(bal_col,  balance)
-        w(csv_cat_col, (txn.get('csv_category') or '').strip()
-                       or learned_spending(desc, cat))
+        w(csv_cat_col, in_clients_spelling(csv_cat_col, (txn.get('csv_category') or '').strip()
+                                           or learned_spending(desc, cat)))
         w(uc_col,   cat)
+        # reviewed_cols ('MUC desc') are deliberately left empty: that is the
+        # reviewer's column, and the AI is the first pass
         if uc_col and review and i < len(review) and review[i]:
             ws.cell(r, uc_col).fill = REVIEW_FILL
             ws.cell(r, uc_col).comment = Comment(REVIEW_NOTE, 'Plutus')
@@ -834,10 +903,14 @@ def write_workbook(
         w(to_col,     (txn.get('to')     or '').strip() or None)
         w(status_col, (txn.get('status') or '').strip() or None)
         w(tag_col,    (txn.get('tag')    or '').strip() or None)
-        for h, v in (txn.get('extra') or {}).items():
+        raw_cols = txn.get('raw') or txn.get('extra') or {}
+        for h, v in raw_cols.items():
             col = passthrough.get(norm_header(h))
-            if col:
+            if col and ws.cell(r, col).value is None:
                 w(col, passthrough_value(col, v))
+        for col in passthrough.values():          # not in the statement: ask history
+            if col in hist and ws.cell(r, col).value is None:
+                w(col, learned_value(col, desc))
 
         # signed amount column
         if amt_col and amt_col not in model_formulas:
@@ -882,7 +955,7 @@ def write_workbook(
     # category when that column is completely free — otherwise (e.g. Ahmed's
     # 'Type' VLOOKUP sits there) the first empty column after the sheet's
     # data. learn_from_feedback finds it by its header, wherever it is.
-    if uc_col and not _col(hdrs, *CORRECTION_COLS):
+    if uc_col and not rc['correct']:
         def empty(c):
             return all(ws.cell(r, c).value in (None, '') for r in range(1, ws.max_row + 1))
         if empty(uc_col + 1):
@@ -908,8 +981,21 @@ def write_workbook(
     except KeyError:
         analysis_name = None
 
-    pivot_year_col = fy_col or acc_col or sa_col
     net_source_col = net_col or amt_col
+    pivot_year_col = None
+    if analysis_name:
+        pivot_year_col = _year_col_for_analysis(
+            wb[analysis_name], ws, (fy_col, acc_col, sa_col), new_last)
+        if pivot_year_col is None and any((fy_col, acc_col, sa_col)):
+            print(f"  [excel_writer] None of the RAW year columns match the year "
+                  f"headings on {analysis_name} — Analysis left untouched.")
+
+    # The Analysis is built on whichever category column its own labels use:
+    # on a two-column template that is the reviewer's final column.
+    analysis_cat_col = uc_col
+    if analysis_name and uc_col and reviewed_cols:
+        analysis_cat_col = _category_col_for_analysis(
+            wb[analysis_name], ws, [uc_col, *reviewed_cols], last_row) or uc_col
 
     if analysis_name and pivot_year_col and net_source_col and uc_col:
         ws_a = wb[analysis_name]
@@ -919,7 +1005,7 @@ def write_workbook(
         snapshot = _snapshot_sheet(ws_a)
         try:
             _update_analysis(ws_a, ws, pivot_year_col, net_source_col,
-                             uc_col, last_data_row=new_last)
+                             analysis_cat_col, last_data_row=new_last)
             problem = _verify_analysis_safe(ws_a, snapshot)
             if problem:
                 _restore_sheet(ws_a, snapshot)
@@ -947,6 +1033,17 @@ def write_workbook(
 
     _refresh_pivot_sources(wb, new_last, raw_sheet=ws.title)
 
+    # money columns are legitimately sparse (an expense-only month has no
+    # Paid in), so they are never reported as "left blank"
+    _collect_warnings(ws, hdrs, model_formulas, last_row, new_last, uc_col,
+                      {c for c in (rc['correct'], in_col, out_col, amt_col, bal_col,
+                                   net_col, *reviewed_cols) if c}, warnings)
+    if warnings is not None and reviewed_cols and uc_col and new_last > last_row:
+        names = ', '.join(f"'{str(ws.cell(1, c).value).strip()}'" for c in reviewed_cols)
+        warnings.append(f"{names} is left empty for the reviewer, as in your existing rows — "
+                        f"the AI's categories are in '{str(ws.cell(1, uc_col).value).strip()}'. "
+                        f"The Analysis sheet picks up the new rows once {names} is filled in.")
+
     # New formula cells carry no saved result, so tell Excel to recalculate
     # the whole workbook when it opens — otherwise Excel for the web and
     # older versions can show them blank. (The template's own calculation
@@ -963,6 +1060,11 @@ def write_workbook(
     for p in problems:
         print(f"  [excel_writer] BALANCE WARNING: {p}")
 
+    lost = _check_pivots_preserved(template_path, output_path)
+    if lost:
+        print(f"  [excel_writer] INTEGRITY WARNING: {lost}")
+        problems.append(lost)
+
     changed = _check_original_rows_untouched(template_path, output_path, ws.title,
                                              last_row)
     if changed:
@@ -970,6 +1072,105 @@ def write_workbook(
         print(f"  [excel_writer] INTEGRITY WARNING: {msg}")
         problems.append(msg)
     return problems
+
+
+def _collect_warnings(ws, hdrs, model_formulas, last_row, new_last, uc_col,
+                      skip_cols, warnings) -> None:
+    """Tell the accountant, in plain English, about template columns that the
+    new rows left empty although the client's own rows fill them — otherwise
+    a template the program only half understands fails silently."""
+    if warnings is None:
+        return
+    if not uc_col:
+        warnings.append("No category column was recognised in the template, so the "
+                        "categories could not be written. Name it e.g. 'UC category'.")
+    n_new = new_last - last_row
+    sample = range(max(2, last_row - 29), last_row + 1)
+    if n_new <= 0 or len(sample) < 5:        # nothing to compare against yet
+        return
+    for h, c in sorted(hdrs.items(), key=lambda kv: kv[1]):
+        if c in model_formulas or c in skip_cols:
+            continue
+        old_filled = sum(1 for r in sample if ws.cell(r, c).value not in (None, ''))
+        new_filled = sum(1 for r in range(last_row + 1, new_last + 1)
+                         if ws.cell(r, c).value not in (None, ''))
+        if old_filled >= 0.5 * len(sample) and new_filled < 0.2 * n_new:
+            name = ws.cell(1, c).value
+            if isinstance(name, str) and name.startswith('='):
+                continue
+            warnings.append(f"Column '{str(name).strip()}' was left blank for "
+                            f"{n_new - new_filled} of the {n_new} new rows — the statement "
+                            f"has no matching column, so please fill it in.")
+
+
+def _year_col_for_analysis(ws_a, raw_ws, candidates, last_row):
+    """Which RAW year column the Analysis grid is built on: the one whose
+    labels (FY25 / 24/25 / SA24) appear among the sheet's headings. With a
+    single year column it is simply that one; with several and no heading
+    match, None — the Analysis must then be left alone rather than rebuilt
+    on the wrong labels (every total would come out 0)."""
+    cands = [c for c in candidates if c]
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0]
+    headings = set()
+    for r in range(1, 11):
+        for c in range(2, ws_a.max_column + 1):
+            v = ws_a.cell(r, c).value
+            if v not in (None, '') and not isinstance(v, float) and not str(v).startswith('='):
+                headings.add(str(v).strip().lower())
+    best, best_hits = None, 0
+    for col in cands:
+        labels = {str(raw_ws.cell(r, col).value).strip().lower()
+                  for r in range(2, last_row + 1)
+                  if raw_ws.cell(r, col).value not in (None, '')}
+        hits = len(labels & headings)
+        if hits > best_hits:
+            best, best_hits = col, hits
+    return best
+
+
+def _category_col_for_analysis(ws_a, raw_ws, candidates, last_row):
+    """Which RAW category column the Analysis grid is built on: the one whose
+    values match the most labels in the sheet's first column (Howayda's
+    labels match 'MUC desc', the reviewer's column, not 'UC desc')."""
+    labels = set()
+    for r in range(1, min(ws_a.max_row, 120) + 1):
+        v = ws_a.cell(r, 1).value
+        if isinstance(v, str) and v.strip() and not v.startswith('='):
+            labels.add(v.strip().lower())
+    best, best_hits = None, 0
+    for col in candidates:
+        if not col:
+            continue
+        values = {str(raw_ws.cell(r, col).value).strip().lower()
+                  for r in range(2, last_row + 1)
+                  if raw_ws.cell(r, col).value not in (None, '')}
+        hits = len(values & labels)
+        if hits > best_hits:
+            best, best_hits = col, hits
+    return best
+
+
+def _pivot_count(path) -> int:
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        return sum(1 for n in z.namelist()
+                   if n.startswith('xl/pivotTables/pivotTable') and n.endswith('.xml'))
+
+
+def _check_pivots_preserved(template_path, output_path):
+    """A warning message when the saved workbook has fewer PivotTables than
+    the template (openpyxl cannot round-trip every pivot), else None."""
+    try:
+        before, after = _pivot_count(template_path), _pivot_count(output_path)
+    except Exception:
+        return None
+    if after < before:
+        return (f"{before - after} PivotTable(s) from the template were not kept "
+                f"in the output — check the Analysis sheet.")
+    return None
 
 
 def _check_original_rows_untouched(template_path, output_path, sheet_name: str,

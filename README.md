@@ -2,12 +2,18 @@
 
 Automates the monthly bank statement → Excel pipeline for an accountant's practice.
 
-Upload a Barclays bank statement (CSV, PDF or XLSX), and the system:
-1. Parses every transaction
-2. Assigns UK financial year labels automatically
-3. Categorises each transaction using a rule layer + Claude AI
-4. Appends all rows to the Excel workbook's RAW tab with live formulas
-5. Rebuilds the Analysis pivot with SUMIFS formulas
+Upload a bank statement (CSV, PDF or Excel, from any UK bank) together with
+the client's own working-papers template, and the system:
+1. Parses every transaction, whatever bank or format it came from
+2. Assigns financial year labels in the client's own convention
+3. Categorises each transaction using the client's history, learned corrections, and Claude AI
+4. Appends all rows to the template's transactions tab with live formulas, matching its existing layout
+5. Rebuilds the Analysis / pivot sheet with SUMIFS formulas, without disturbing the accountant's own workings
+
+**New here?**
+- **Installing Plutus for the first time** on a computer → **[SETUP_GUIDE.md](SETUP_GUIDE.md)**
+- **Processing statements day to day, and teaching it from your corrections** → **[USER_GUIDE.md](USER_GUIDE.md)**
+- The rest of this file is a technical reference (how it works, project layout, CLI usage).
 
 ---
 
@@ -198,10 +204,13 @@ Then open your browser and go to: **http://localhost:5173**
 ## How to use
 
 1. Open **http://localhost:5173**
-2. Drag and drop a Barclays bank statement onto the upload zone, or click to browse
-3. Wait for the progress steps to complete (Parsing → AI Categorisation → Writing Excel)
-4. Click **Download Excel** to get the processed workbook
+2. Drag and drop the client's bank statement onto the first upload zone, and their existing working-papers template onto the second
+3. Click **Process Statement** and wait for the progress steps to complete (Parsing → AI categorisation → Writing Excel)
+4. Review the result screen, including any "Please check" items, then click **Download Excel** to get the processed workbook
 5. Click **Process another statement** or the back arrow to process another file
+
+For the full walkthrough — including how to correct a wrong category and
+teach the system from it — see **[USER_GUIDE.md](USER_GUIDE.md)**.
 
 ---
 
@@ -209,11 +218,11 @@ Then open your browser and go to: **http://localhost:5173**
 
 | Format | Source |
 |--------|--------|
-| `.csv` | Barclays online banking → Download → CSV |
-| `.pdf` | Barclays online banking → Download → PDF |
-| `.xlsx` | Barclays online banking → Download → Excel |
+| `.csv` | Any UK bank's online banking → Download transactions → CSV |
+| `.pdf` | A statement saved as PDF, from online banking or the bank directly (scanned/photographed statements are also read, using AI to read the page image — see Housekeeping below) |
+| `.xlsx` / `.xls` | Online banking → Download → Excel (both current and old Excel 97–2003 `.xls` files work) |
 
-> The output is always an `.xlsx` file — your master workbook with the new rows appended.
+> The output is always an `.xlsx` file — the client's own template workbook with the new rows appended, in their existing layout and formatting.
 
 ---
 
@@ -223,56 +232,66 @@ Then open your browser and go to: **http://localhost:5173**
 Plutus Accountant Automation Suite/
 │
 ├── api/
-│   └── server.py           # FastAPI backend (upload, progress, download)
+│   ├── server.py           # FastAPI backend (upload, progress, download)
+│   └── jobs.py             # Job tracking that survives a restart, file clean-up
 │
 ├── core/
-│   ├── financial_year.py   # UK FY logic (6 Apr – 5 Apr boundary)
-│   ├── categorise.py       # Rule layer + Claude Haiku categorisation
-│   └── excel_writer.py     # Appends to RAW tab, rebuilds Analysis pivot
+│   ├── financial_year.py   # UK tax-year logic (6 Apr – 5 Apr boundary)
+│   ├── year_labels.py      # Learns each client's OWN financial-year convention from their rows
+│   ├── columns.py          # Works out which template column plays which role
+│   ├── categorise.py       # Client history + learned corrections + Claude AI
+│   └── excel_writer.py     # Appends new rows, rebuilds the Analysis / pivot sheet
 │
 ├── parsers/
-│   ├── parse_csv.py        # Barclays CSV parser
-│   ├── parse_pdf.py        # Barclays PDF parser (pdfplumber)
-│   └── parse_xls.py        # Barclays XLSX parser (openpyxl)
+│   ├── _common.py          # Shared column-detection / row-parsing (CSV & Excel)
+│   ├── parse_csv.py        # CSV parser (any UK bank)
+│   ├── parse_pdf.py        # PDF parser — ruled tables, column-position layout, AI fallback, scanned PDFs
+│   └── parse_xls.py        # Excel parser (.xlsx and legacy .xls)
 │
 ├── scripts/
-│   └── recalc.py           # Optional LibreOffice headless recalculation
+│   ├── learn_from_feedback.py       # Builds core/learned_examples.json from corrected files in Feedbacks/
+│   ├── validate_feedback_accuracy.py # Held-out accuracy check against Feedbacks/
+│   └── recalc.py                     # Optional LibreOffice recalculation (not needed for normal use)
 │
 ├── frontend/               # React + Vite + Tailwind frontend
 │   └── src/
 │       ├── pages/          # UploadPage, ProcessingPage, ResultPage, ErrorPage
 │       └── components/     # UploadZone, ProcessingPanel, ResultPanel
 │
-├── Samples/
-│   └── Bank summarised Behesta v1 2025.xlsx   # Master Excel template
+├── tests/                  # Automated tests (invented data only) — see Housekeeping below
 │
-├── output/                 # Processed files are saved here (auto-created)
-├── uploads/                # Temporary upload storage (auto-created)
+├── Feedbacks/               # Put your corrected output files here, then run learn.bat
+├── output/                  # Processed files are saved here (auto-created)
+├── uploads/                 # Temporary upload storage (auto-created)
 │
-├── main.py                 # CLI entry point (optional, bypasses frontend)
-├── requirements.txt        # Python dependencies
-└── .env.example            # API key template
+├── main.py                  # CLI entry point (optional, bypasses frontend)
+├── learn.bat                # Reads Feedbacks/ and updates learned_examples.json
+├── start.bat / install.bat  # Launch / one-time setup scripts
+├── requirements.txt         # Python dependencies
+├── requirements-dev.txt     # Adds pytest and friends, for running the test suite
+├── USER_GUIDE.md             # Day-to-day usage guide (start here if you're new to using it)
+├── SETUP_GUIDE.md            # First-time installation guide
+└── .env.example              # API key template
 ```
 
 ---
 
-## Column layout written to RAW tab (A–M)
+## How the template's columns are read
 
-| Col | Name | Content |
-|-----|------|---------|
-| A | No | Sequential row number |
-| B | SA | UK FY label e.g. `FY24` |
-| C | ACC | FY range e.g. `24/25` |
-| D | Date | Transaction date |
-| E | Subcategory | Bank's own transaction type |
-| F | Memo | Transaction description |
-| G | Paid in | Credit amount |
-| H | Paid out | Debit amount |
-| I | Balance | Statement balance (blank for CSV/XLSX) |
-| J | NET | Formula `=G-H` |
-| K | Balance UC | Running balance formula chain |
-| L | Check UC | Formula `=I-K` (only when balance present) |
-| M | UC Category | Category assigned by the system |
+Older versions of this tool expected a fixed column layout. The current
+version instead works out each column's role from the client's own
+template — by name first, then by the words in the header, then by what the
+column actually contains — so it adapts to each accountant's own layout
+instead of requiring one fixed format. See
+[Working with unfamiliar templates and statements](#working-with-unfamiliar-templates-and-statements)
+below for the details, and `core/columns.py` for the implementation.
+
+Typical roles found in a RAW/transactions tab: a sequence number, financial
+year label(s), date, description (and sometimes a separate payee column),
+reference, transaction type, paid in / paid out (or a single signed
+amount), balance, a NET formula, a running-balance check, the category the
+system assigns, and a "Correct category" column for the accountant's
+corrections.
 
 ---
 
@@ -287,57 +306,146 @@ Plutus Accountant Automation Suite/
 
 ## Category list
 
-The system categorises every transaction into one of these fixed categories:
+Categories are chosen in this order of priority (see `core/categorise.py`):
 
-```
-Accountancy, Bank charges, Car Insurance, Charging, Company Car,
-DLA, Directors salary, Donation, Entertainment, Equipment,
-Gym, HMRC, In/Out, Income, Insurance, Interest income,
-Investment, Lunch, Mobile phone, Mother Salary, Parking,
-Penalty fee, Petrol, Postage, Professional, Professional fees - College,
-Refund, Subscription, Sundry, Taxes for mother, Taxi, Train, Travel
-```
+1. **The client's own template history** — when a payee has always been
+   given one category in that client's existing rows, that category is
+   reused directly, with no AI call.
+2. **Corrections the accountant made on previous outputs**
+   (`core/learned_examples.json`, built by `scripts/learn_from_feedback.py`
+   — see [Learning from corrections](#learning-from-corrections-the-feedback-loop)
+   below), reused the same way.
+3. **The payment reference**, for HMRC payments specifically (PAYE,
+   Corporation Tax, Self Assessment, from the reference number's format).
+4. **Claude**, for everything else — using the client's own category
+   vocabulary where it applies, falling back to a general list when it
+   doesn't:
 
-Known payees are matched by rules instantly (no API cost). Unknown transactions are sent to Claude AI. Results are cached so repeated payees are never re-sent.
+   ```
+   AOP, Accommodation, Accountancy, Accountancy fee, Bank charges, Car,
+   Car insurance, Car lease, Charging Car, Cleaning, College, Company Car,
+   Computer, CPD Grant, DBS, Dinner, Directors Loan Account, DLA,
+   Directors salary, Dividends, Donation, Education Course, Entertainment,
+   Equipment, FODO, Food, GOC, Gym, Heat, HMRC, HMRC-CT, HMRC-PAYE,
+   HMRC-SA, HMRC-VAT, HMRC - maternity pay, Hotel, Income, Insurance,
+   Insurance - AOP, Interest income, Internet, Light and heat, Lunch,
+   Marketing, Mobile phone, Other direct costs, Parking, PCSE,
+   Penalty fee, Petrol, Postage, Professional fee, Professional - College,
+   Professional - AOP, Professional - GOC, Purchase, Refund, Rent,
+   Repairs, Sales, Security, SIPP, SMP, Staff benefits, Stationary,
+   Subscriptions, Sundry, Taxi, Telephone, Toll, Train, Transfer, Travel,
+   Trivial benefits, Wages, Wages-staff, Water, Website, Work from home,
+   Unknown
+   ```
+
+   Claude also says whether it is sure; rows it isn't sure about (and any
+   row it can only answer "Unknown" for) are highlighted yellow in the
+   output for the accountant to check.
+
+Afterwards, every category is reduced to one spelling per meaning (`DLA`
+vs `Directors Loan Account`) — preferring the client's own spelling — and
+payments to the same person for the same purpose (e.g. several wordings of
+a director's loan) are given one consistent category.
+
+Known payees are matched instantly, at no API cost. Only genuinely new
+payees are sent to Claude, and identical transactions within one statement
+are only asked about once.
+
+---
+
+## Learning from corrections (the feedback loop)
+
+When the accountant types the right category into the **"Correct
+category"** column of a processed file and puts that file in the
+`Feedbacks/` folder, running `learn.bat` (or
+`venv\Scripts\python scripts\learn_from_feedback.py`) rebuilds
+`core/learned_examples.json` from every file in that folder. No restart is
+needed — the backend reads the file fresh on each upload.
+
+A payee's corrections become a rule once they agree with each other at
+least 60% of the time (`MIN_SHARE` in `scripts/learn_from_feedback.py`); a
+payee corrected to different categories each time is left for the AI to
+keep deciding, since there's no single clear answer to learn from it.
+
+See **[USER_GUIDE.md](USER_GUIDE.md#5-correcting-a-wrong-category)** for
+the full step-by-step walkthrough, and
+`scripts/validate_feedback_accuracy.py` for a held-out accuracy check
+against the `Feedbacks/` files.
+
+---
+
+## Housekeeping and tests
+
+- Processed workbooks, job records and uploads are deleted after 24 hours (change with the `PLUTUS_RETENTION_HOURS` environment variable). Finished jobs can still be downloaded after the server restarts.
+- Scanned (image-only) PDFs are read by Claude from the page images, every row is checked against the printed running balance, and the results page tells the accountant to verify the figures. **Privacy:** for scans only, the page images (including anything printed on them, such as name and account number) are sent to Anthropic. Set `PLUTUS_SCAN_AI=0` in `.env` to switch this off, in which case scans are rejected with a clear message.
+- Excel recalculates the output when it opens it, so LibreOffice is not needed. For the CLI, `--recalc` is optional and never replaces the file if it would lose PivotTables.
+- Run the tests (all use invented data): `venv\Scripts\pip install -r requirements-dev.txt` then `venv\Scripts\python -m pytest`.
+- The Claude model used for categorisation can be changed with the `CATEGORISE_MODEL` environment variable (default `claude-sonnet-5`); see `.env.example` for this and the other optional settings above.
+
+---
+
+## Working with unfamiliar templates and statements
+
+- **Template columns are recognised by name, then by the words in the header, then by what the column contains** (see `core/columns.py`). So `UC category`, `Category  UC` and `UC desc` are all found as the category column; `Year` / `Personal` holding `FY24` / `23/24` are found as year columns; `Spending`, `Category Bank` and a plain `Category` next to a UC column are the bank's own category.
+- **Two-column review templates** (`UC desc` = first pass, `MUC desc` = the reviewer's final category): the AI fills the first-pass column only and leaves the reviewer's column empty, learns from the reviewer's column, and builds the Analysis on whichever category column the Analysis labels actually use.
+- **Any statement column whose header matches a template header is copied across** (Transaction ID, Time, Category, Account Name ...).
+- **Blank Type / Name / bank-category cells** (PDF statements do not print them) are filled from what the client's own rows hold for the same payee, in the client's own spelling — only when that payee repeated the same value at least twice. Nothing is guessed.
+- **Anything that still cannot be filled is reported** on the results page ("Please check") instead of being left blank silently.
+- **Spreadsheets saved with day and month swapped** (US-locale Excel) are detected from the order of the dates and put right.
+- **HMRC payments** are categorised from the payment reference format (PAYE, Corporation Tax, Self Assessment) — unless the client's own history already has a consistent category for that payee, which always wins.
+- **A separate payee column** (Monzo's `Name` next to a `Description` that is often just a code) is used for matching history and sent to the AI, so `EE` / `BP` / `O2` are recognised.
+- **"Food?"-style labels** in the accountant's own rows are treated as *Food, please check*: the category written is `Food` and the row is highlighted for review. The question-mark spellings are never offered to the AI as categories.
+- **The Analysis grid is only rebuilt on the RAW year column whose labels match its headings**; when no column matches, the sheet is left untouched.
 
 ---
 
 ## Security notes
 
-- Your Anthropic API key is stored only in the `.env` file — never committed to version control
-- Bank account numbers, sort codes, IBANs and account holder names are **never sent to the AI**
-- Only the transaction description, subcategory and credit/debit direction are sent for categorisation
-- All processing happens on your local machine — no data is sent to any external server except Anthropic's API for categorisation
+- Your Anthropic API key is stored only in the `.env` file — never committed to version control.
+- **Account numbers, sort codes and IBANs are scrubbed from every field before it is sent for categorisation** (see `_scrub` in `core/categorise.py`). This is a pattern-based scrub for those specific number formats — it does not remove ordinary names that appear in a transaction description or payee field (e.g. a payment reference naming the person paid), since that wording is usually what lets the AI categorise the payment correctly (salary vs dividend vs loan, for example).
+- The fields sent for categorisation are the date, description, payee (when the statement has one), transaction type, payment reference, the bank's own category hint, and the money in/out amount — all scrubbed as above first.
+- All processing happens on your local machine — no data is sent to any external server except Anthropic's API, for categorisation and, for scanned PDFs only, reading the page images (see [Housekeeping and tests](#housekeeping-and-tests)).
 
 ---
 
 ## CLI usage (optional, without the frontend)
 
-You can also run the pipeline directly from the command line:
+You can also run the pipeline directly from the command line. This project
+does not ship a sample template, so always pass `--template` explicitly,
+pointing at the client's own working-papers file:
 
 ```
 # CSV
-venv\Scripts\python main.py --input "Samples\May 24.csv"
+venv\Scripts\python main.py --input "path\to\statement.csv" --template "path\to\template.xlsx"
 
-# PDF
-venv\Scripts\python main.py --input "Samples\Statement 03-MAY-24.pdf"
+# PDF (including a scanned PDF, if ANTHROPIC_API_KEY is set)
+venv\Scripts\python main.py --input "path\to\statement.pdf" --template "path\to\template.xlsx"
 
-# Custom template or output path
+# Custom output path
 venv\Scripts\python main.py --input "path\to\statement.csv" --template "path\to\template.xlsx" --output "path\to\output.xlsx"
 
-# Append to RAW (3) instead of RAW (2)
-venv\Scripts\python main.py --input "statement.csv" --sheet "RAW (3)"
+# Append to a specific RAW sheet when the template has more than one
+venv\Scripts\python main.py --input "statement.csv" --template "template.xlsx" --sheet "RAW (3)"
+
+# Also recalculate with LibreOffice (optional; Excel recalculates on open anyway)
+venv\Scripts\python main.py --input "statement.csv" --template "template.xlsx" --recalc
 ```
 
 ---
 
 ## Troubleshooting
 
+> For everyday issues while processing statements (a wrong category, a
+> "Please check" message, a statement that's already fully in the
+> workbook, a scanned PDF), see
+> **[USER_GUIDE.md § 7](USER_GUIDE.md#7-everyday-troubleshooting)**. The
+> items below are about installing or running the system itself.
+
 **"No transactions found in the uploaded file"**
-- Make sure the file is a genuine Barclays export, not a manually created spreadsheet
+- Make sure the file is a genuine export from online banking, not a manually created spreadsheet
 - Check the file opens correctly in Excel/a text editor
 
-**"No API key – marking X txns as Sundry"**
+**"No API key — marking N txns as 'Unknown'"**
 - Your `.env` file is missing or the key is invalid
 - Copy `.env.example` to `.env` and add your key
 

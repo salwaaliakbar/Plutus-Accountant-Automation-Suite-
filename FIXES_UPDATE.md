@@ -63,5 +63,5 @@ While fixing the reported issues we found and fixed these as well:
 ## Known limitations
 
 - **Older .xls files** (Excel 97–2003 format) are not accepted yet. Please save them as .xlsx first. We can add direct support if needed.
-- **Scanned PDFs** (images with no selectable text) cannot be read reliably. A CSV download from online banking is the best alternative.
+- **Scanned PDFs** are now read by AI from the page images. Accuracy depends on the scan, so the results page asks the accountant to check every figure. A CSV download from online banking is still the most reliable source.
 - **Warnings** about rows that couldn't be read, or template columns that are missing, are currently recorded on the server, not shown on screen. We recommend showing them in the app as a next step.

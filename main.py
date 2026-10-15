@@ -11,7 +11,7 @@ The script:
   3. Categorises each transaction (rule layer + Claude Haiku).
   4. Appends rows to the RAW (2) tab of the template workbook.
   5. Rebuilds the Analysis pivot with SUMIFS formulas.
-  6. Saves the result to output/.
+  6. Saves the result to output/. (Add --recalc to also recalculate with LibreOffice.)
 """
 
 import argparse
@@ -32,6 +32,8 @@ def main():
     parser.add_argument('--input',    required=True,  help='Path to CSV or PDF bank statement')
     parser.add_argument('--template', default=str(TEMPLATE), help='Master Excel template')
     parser.add_argument('--output',   default=None,   help='Output xlsx path (default: output/<input_stem>.xlsx)')
+    parser.add_argument('--recalc',   action='store_true',
+                        help='Also recalculate with LibreOffice (optional; Excel recalculates on open)')
     parser.add_argument('--sheet',    default='RAW (2)', help='RAW sheet to append to')
     args = parser.parse_args()
 
@@ -62,11 +64,11 @@ def main():
         from parsers.parse_pdf import parse_pdf
         year_hint = _infer_year(input_path.name)
         transactions = parse_pdf(input_path, year_hint=year_hint)
-    elif suffix == '.xlsx':
+    elif suffix in ('.xlsx', '.xls'):
         from parsers.parse_xls import parse_xls
         transactions = parse_xls(input_path)
     else:
-        print(f"Error: unsupported file type '{suffix}'. Use .csv, .pdf or .xlsx", file=sys.stderr)
+        print(f"Error: unsupported file type '{suffix}'. Use .csv, .pdf, .xlsx or .xls", file=sys.stderr)
         sys.exit(1)
 
     print(f"[main] Parsed {len(transactions)} transactions.")
@@ -105,6 +107,7 @@ def main():
     # ── 3. Write to Excel ─────────────────────────────────────────────────────
     print(f"[main] Writing to {output_path} ...")
     from core.excel_writer import write_workbook
+    template_warnings = []
     problems = write_workbook(
         transactions,
         categories,
@@ -112,7 +115,10 @@ def main():
         output_path=output_path,
         sheet_name=args.sheet,
         review=review,
+        warnings=template_warnings,
     )
+    for w in template_warnings:
+        print(f"[main] NOTE: {w}")
     if problems:
         print(f"[main] WARNING: {len(problems)} balance(s) do not add up — "
               f"check these rows against the statement:")
@@ -121,10 +127,11 @@ def main():
     else:
         print("[main] Balances reconcile: every new row = previous balance + amount.")
 
-    # ── 4. Recalculate (LibreOffice) ──────────────────────────────────────────
-    print("[main] Attempting LibreOffice recalculation...")
-    from scripts.recalc import recalc
-    recalc(output_path)
+    # ── 4. Recalculate (LibreOffice, only on request) ─────────────────────────
+    if args.recalc:
+        print("[main] Attempting LibreOffice recalculation...")
+        from scripts.recalc import recalc
+        recalc(output_path)
 
     print(f"\n[main] Done. Output: {output_path}")
 
