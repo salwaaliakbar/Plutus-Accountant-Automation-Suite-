@@ -76,7 +76,7 @@ Open **Command Prompt** and run these commands one at a time.
 
 2. Download (clone) the project:
    ```
-   git clone https://github.com/mudasirmujtaba/Plutus-Accountant-Automation-Suite-.git
+   git clone https://github.com/salwaaliakbar/Plutus-Accountant-Automation-Suite-.git
    ```
 
 3. Enter the project folder:
