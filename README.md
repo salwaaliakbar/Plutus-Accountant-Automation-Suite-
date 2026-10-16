@@ -11,193 +11,65 @@ the client's own working-papers template, and the system:
 5. Rebuilds the Analysis / pivot sheet with SUMIFS formulas, without disturbing the accountant's own workings
 
 **New here?**
-- **Installing Plutus for the first time** on a computer → **[SETUP_GUIDE.md](SETUP_GUIDE.md)**
-- **Processing statements day to day, and teaching it from your corrections** → **[USER_GUIDE.md](USER_GUIDE.md)**
-- The rest of this file is a technical reference (how it works, project layout, CLI usage).
+- **Installing and starting Plutus** → [Getting started](#getting-started) below
+- **Teaching it from your corrections** → [Correcting categories and teaching Plutus](#correcting-categories-and-teaching-plutus) below
+- **Processing statements day to day, in detail** → **[USER_GUIDE.md](USER_GUIDE.md)**
+- From [Supported input formats](#supported-input-formats) onwards, this file is a technical reference (how it works, project layout, CLI usage).
 
 ---
 
-## Prerequisites
+## Prerequisites (install once per computer)
 
 | Tool | Version | Download |
 |------|---------|----------|
 | Python | 3.10 or higher | https://www.python.org/downloads/ |
-| Node.js | 18 or higher | https://nodejs.org/ |
-| VS Code | Latest | https://code.visualstudio.com/ |
-| Git | Latest | https://git-scm.com/download/win |
+| Node.js | 18 or higher (the **LTS** version) | https://nodejs.org/ |
 
-> **Installing Git:** open the Git link above, download the Windows installer, open it, and keep clicking **Next** until it says **Finish**. You do not need to change any settings.
+> **Installing Python:** on the first screen of the installer, tick **"Add python.exe to PATH"** before clicking **Install Now**. Without it, `install.bat` cannot find Python.
 
 ---
 
-## Which one are you? (read this first)
+## Getting started
 
-| Your situation | What to do |
-|----------------|------------|
-| **I have never installed this project before** | Go to **"First time: get the project"** just below, then do **Setup (one-time)**. |
-| **I already installed this project before** and just want the newest version | Skip Setup. Go straight to **"Already installed before? Get the latest update"**. |
+Everything is done by double-clicking `.bat` files, so you never need to type commands.
 
----
+### 1. Download and unzip
 
-## First time: get the project
+1. Download the Plutus `.zip` file.
+2. Right-click it, choose **Extract All...**, then click **Extract**.
+3. Open the extracted folder. Make sure you are in the folder with `main.py`, `frontend` and the `.bat` files inside. If you only see one folder with almost the same name, open it.
 
-You only do this **once**, the very first time.
+This is your **project folder**. Always use this same folder.
 
-1. Open **File Explorer** and click **Desktop** on the left side.
-2. Click once inside the **address bar** at the top of the window (where the folder path is written).
-3. Type `cmd` and press **Enter**. A black window opens.
-4. Paste this and press **Enter**:
+### 2. Install (one-time)
 
-```
-git clone https://github.com/salwaaliakbar/Plutus-Accountant-Automation-Suite-.git
-```
+Double-click **`install.bat`**. It sets up everything Plutus needs, which takes a few minutes. Wait until it says **Installation complete**, then press any key to close the window.
 
-5. Wait until it stops writing text. A new folder called **Plutus-Accountant-Automation-Suite-** is now on your Desktop. This is your project folder.
-6. Close the black window and continue with **Step 0** and then **Setup (one-time)** below.
+> If Windows shows **"Windows protected your PC"**, click **More info** and then **Run anyway**.
 
-> **Important:** from now on, always use **this same folder**. Do not download the project again as a ZIP — if you do, the update command below will not work.
+### 3. Add your API key (the `.env` file)
 
----
+The `.env` file holds your Anthropic API key. It must sit in the project folder, next to `main.py`.
 
-## Already installed before? Get the latest update
-
-Did you already install and use this project before? Then you **do not** need to install everything again. Just do these steps every time you are told there is a new update.
-
-**1. Close the project if it is running**
-
-If the two black windows (backend and frontend) are open, close both of them.
-
-**2. Open a terminal in the SAME project folder you used before**
-
-Follow **Step 0** below, and make sure you open the **same folder** you installed last time (the one with `main.py` and `frontend` inside).
-
-**3. Download the latest code**
-
-Paste this and press **Enter**:
-
-```
-git pull
-```
-
-Wait until it stops writing text. You will see one of these:
-
-- A list of file names, or the words **"Fast-forward"** → the update was downloaded. Go to step 4.
-- **"Already up to date."** → you already have the newest version. Go to step 4 anyway.
-
-**4. Update the packages (in case new ones were added)**
-
-In the same black window, paste this and press **Enter**:
-
-```
-venv\Scripts\pip install -r requirements.txt
-```
-
-Then paste this and press **Enter**:
-
-```
-cd frontend
-npm install
-```
-
-(If you get a red error message here, paste `npm.cmd install` instead.)
-
-**5. Start the project as normal**
-
-Close the black window and follow the **Running the project** section below.
-
-> **Don't worry:** `git pull` does **not** delete your API key (`.env` file), your output Excel files, or your bank statements. Only the program code is updated.
-
-**If `git pull` shows an error:**
-
-| Message you see | What it means | What to do |
-|-----------------|---------------|------------|
-| `'git' is not recognized...` | Git is not installed | Install Git (see **Prerequisites** at the top), close the black window, open a new one, and try again. |
-| `not a git repository` | You are in the wrong folder, **or** you downloaded the project as a ZIP last time | First check you opened the right folder (Step 0). If you did download a ZIP, do **"First time: get the project"** once to get a fresh copy, then do **Setup (one-time)** in the new folder, and copy your `.env` file from the old folder into the new folder. |
-| `Your local changes ... would be overwritten` | A project file was changed on your computer | Paste `git stash` and press **Enter**, then paste `git pull` again. |
-
----
-
-## Step 0 — Open a terminal in the project folder
-
-1. Open File Explorer and go into the project folder (the one with `main.py` and `frontend` inside — if you see another folder with almost the same name, open that one first).
-2. Click once inside the address bar at the top of the window (where the folder path is written).
-3. Type `cmd` and press Enter.
-
-A black window opens — this is your terminal. Do this every time a step below says "open a terminal".
-
----
-
-## Setup (one-time)
-
-> Already installed this project before? **Skip this whole section** and use **"Already installed before? Get the latest update"** above.
-
-### 1. Install Python packages
-
-Open a terminal (Step 0). Paste this and press Enter:
-
-```
-python -m venv venv
-venv\Scripts\pip install -r requirements.txt
-```
-
-### 2. Add your Anthropic API key
-
-Paste this and press Enter:
-
-```
-copy .env.example .env
-```
-
-Open the new `.env` file, and replace the text with your real key:
+- **If you were given a `.env` file:** copy it into the project folder.
+- **If not:** `install.bat` creates one and opens it in Notepad. Replace `sk-ant-...` with your real key, then save and close Notepad:
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...your-real-key-here...
 ```
 
-### 3. Install frontend files
+> The file name must be exactly `.env`, not `.env.txt`. If the key is missing or wrong, Plutus still runs, but every new payee gets categorised as **Unknown**.
 
-Open a terminal (Step 0). Paste this and press Enter:
+### 4. Start Plutus (every time)
 
-```
-cd frontend
-npm install
-```
+Double-click both of these files in the project folder:
 
-Did it finish with no red text? Go to the next section.
+1. **`start_backend.bat`**: opens a window called **Plutus - Engine**.
+2. **`start_frontend.bat`**: opens a window called **Plutus - Web UI**, and your browser opens **http://localhost:5173** after a few seconds.
 
-Did you get a **red error message**? Paste this instead:
+Keep both windows open while you work. To stop Plutus, close both windows.
 
-```
-npm.cmd install
-```
-
----
-
-## Running the project
-
-You need **two terminals open at the same time**.
-
-**Terminal 1 — Backend**
-
-Open a terminal (Step 0). Paste this and press Enter:
-```
-venv\Scripts\uvicorn api.server:app --host 127.0.0.1 --port 8000 --reload
-```
-
-**Terminal 2 — Frontend**
-
-Open another terminal (Step 0). Paste this and press Enter:
-```
-cd frontend
-npm run dev
-```
-
-Did you get a **red error message**? Paste this instead:
-```
-npm.cmd run dev
-```
-
-Then open your browser and go to: **http://localhost:5173**
+> **Shortcut:** `start.bat` starts both at once and opens the browser.
 
 ---
 
@@ -209,8 +81,36 @@ Then open your browser and go to: **http://localhost:5173**
 4. Review the result screen, including any "Please check" items, then click **Download Excel** to get the processed workbook
 5. Click **Process another statement** or the back arrow to process another file
 
-For the full walkthrough — including how to correct a wrong category and
-teach the system from it — see **[USER_GUIDE.md](USER_GUIDE.md)**.
+For the full walkthrough, see **[USER_GUIDE.md](USER_GUIDE.md)**.
+
+---
+
+## Correcting categories and teaching Plutus
+
+When Plutus gets a category wrong, correct it once and Plutus learns it for next time.
+
+1. Open the processed Excel file you downloaded.
+2. Find the wrong category in the **UC category** column. Type the correct category in the column **right next to it**. Leave that cell empty on rows that are already correct.
+3. Save the file and put it in the **`Feedbacks`** folder inside the project folder.
+4. Double-click **`learn.bat`**. It reads every file in `Feedbacks` and saves what it learned. Press any key to close it when it finishes.
+
+There's no need to restart Plutus. The next statement you upload uses the new corrections.
+
+> **Keep your old files in `Feedbacks`.** `learn.bat` re-learns from every file in the folder each time, so a file you remove takes its corrections with it.
+>
+> **Be consistent:** Plutus only learns a payee once most of its corrections agree. A payee corrected to different categories each time is left for the AI to decide. See [Learning from corrections](#learning-from-corrections-the-feedback-loop) for the details.
+
+---
+
+## Getting a new version
+
+1. Close the two Plutus windows.
+2. Download the new `.zip` and unzip it into a **new** folder, as in step 1 above.
+3. From your old project folder, copy these into the new one:
+   - the **`.env`** file
+   - the files inside the **`Feedbacks`** folder
+4. In the new folder, double-click **`install.bat`** (the update may need new packages), then **`learn.bat`** to restore what Plutus learned from your corrections.
+5. Start Plutus as usual. Once everything works, you can delete the old folder.
 
 ---
 
@@ -266,7 +166,10 @@ Plutus Accountant Automation Suite/
 │
 ├── main.py                  # CLI entry point (optional, bypasses frontend)
 ├── learn.bat                # Reads Feedbacks/ and updates learned_examples.json
-├── start.bat / install.bat  # Launch / one-time setup scripts
+├── install.bat              # One-time setup (Python environment, packages, .env)
+├── start_backend.bat        # Starts the backend engine (port 8000)
+├── start_frontend.bat       # Starts the web interface (port 5173) and opens the browser
+├── start.bat                # Starts both at once
 ├── requirements.txt         # Python dependencies
 ├── requirements-dev.txt     # Adds pytest and friends, for running the test suite
 ├── USER_GUIDE.md             # Day-to-day usage guide (start here if you're new to using it)
@@ -447,20 +350,22 @@ venv\Scripts\python main.py --input "statement.csv" --template "template.xlsx" -
 
 **"No API key — marking N txns as 'Unknown'"**
 - Your `.env` file is missing or the key is invalid
-- Copy `.env.example` to `.env` and add your key
+- See [step 3 of Getting started](#3-add-your-api-key-the-env-file): put the `.env` file next to `main.py` with your real key, then close and restart `start_backend.bat`
+
+**A `.bat` window says "Python environment not found", "Web interface not installed" or ".env file not found"**
+- Setup hasn't been done in this folder yet. Double-click `install.bat`, wait for **Installation complete**, then try again.
+- For `.env file not found`, see [step 3 of Getting started](#3-add-your-api-key-the-env-file).
+
+**`install.bat` says "Python not found" or "Node.js not found"**
+- Install the missing tool (see [Prerequisites](#prerequisites-install-once-per-computer)). For Python, tick **"Add python.exe to PATH"**. Then double-click `install.bat` again.
 
 **Backend won't start**
-- Make sure you're in the project root and the venv is activated
-- Run `venv\Scripts\pip install -r requirements.txt` again
+- Double-click `install.bat` again. It is safe to re-run and reinstalls any missing packages.
 
 **Frontend shows blank page**
 - Make sure the backend is running on port 8000 before opening the frontend
 - Check the browser console for errors (F12)
 
-**`npm install` or `npm run dev` shows a red error about "running scripts is disabled" / execution policy**
+**Can't find `main.py` / `frontend` / the `.bat` files**
 
-Switch to Command Prompt and use `npm.cmd` instead of `npm` — see Setup step 3 and the Running section above for the exact steps.
-
-**Can't find `main.py` / `frontend` / the right folder to run commands in**
-
-See Step 0 above — GitHub downloads sometimes create a folder inside another folder of the same name.
+Unzipping sometimes creates a folder inside another folder of the same name. Open the inner folder. See [step 1 of Getting started](#1-download-and-unzip).
