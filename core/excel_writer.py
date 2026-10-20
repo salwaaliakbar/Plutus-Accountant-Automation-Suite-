@@ -1194,6 +1194,11 @@ def _check_original_rows_untouched(template_path, output_path, sheet_name: str,
             if (isinstance(v1, float) and isinstance(v2, float)
                     and abs(v1 - v2) < 1e-6):
                 continue
+            # A literal empty-string cell can come back as None after a save
+            # round trip, even completely untouched — both mean "blank" on a
+            # spreadsheet, so this is not a real change either.
+            if (v1, v2) in ((None, ''), ('', None)):
+                continue
             # row 1 is the header — a new 'Correct category' column is allowed.
             if r == 1 and v1 is None:
                 continue

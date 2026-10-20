@@ -27,7 +27,7 @@ from parsers._common import DATE_HEADERS, norm_header
 DESC_COLS = ('Counter Party', 'Counterparty', 'Description', 'Transaction description',
              'Transaction Details', 'Details', 'Memo', 'Narrative', 'Particulars',
              'Payee', 'Name', 'Merchant')
-IN_COLS = ('Paid in', 'Money in', 'In', 'Credit', 'Credits', 'Receipts', 'Deposits')
+IN_COLS = ('Paid in', 'Money in', 'In', 'Credit', 'Credits', 'Deposits')
 OUT_COLS = ('Paid out', 'Money out', 'Out', 'Debit', 'Debits', 'Payments',
             'Withdrawals', 'Withdrawn')
 UC_COLS = ('UC category', 'UC Category', 'UC')

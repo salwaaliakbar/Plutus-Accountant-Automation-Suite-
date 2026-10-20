@@ -168,8 +168,10 @@ def fix_swapped_dates(rows: list, date_col) -> int:
 
 
 def norm_header(h) -> str:
-    """'Paid In (£)' / ' Paid in ' / 'Amount (GBP)' -> comparable key."""
-    s = str(h).lower().replace('£', ' ')
+    """'Paid In (£)' / ' Paid in ' / 'Amount (GBP)' / 'Amount in GBP' -> comparable key."""
+    s = str(h).lower()
+    s = re.sub(r'\bin\s*(?:gbp\b|£)', ' ', s)    # 'Amount in GBP' / 'Amount in £' -> 'amount'
+    s = s.replace('£', ' ')
     s = re.sub(r'\((?:gbp|\s*)\)|\bgbp\b', ' ', s)
     s = re.sub(r'[^a-z0-9]+', ' ', s)
     return s.strip()
@@ -205,7 +207,7 @@ TYPE_HEADERS = ('Type', 'Transaction Type', 'Payment Type')
 CAT_HEADERS  = ('Spending Category', 'Category name', 'Category')
 BAL_HEADERS  = ('Balance', 'Running Balance', 'Account Balance')
 IN_HEADERS   = ('Paid in', 'Money in', 'In', 'Credit', 'Credits', 'Credit Amount',
-                'Receipts', 'Deposits', 'Paid In Amount')
+                'Deposits', 'Paid In Amount')
 OUT_HEADERS  = ('Paid out', 'Money out', 'Out', 'Debit', 'Debits', 'Debit Amount',
                 'Withdrawn', 'Withdrawals', 'Payments', 'Paid Out Amount')
 AMT_HEADERS  = ('Amount', 'Value', 'Transaction Amount', 'Net Amount')
@@ -326,6 +328,7 @@ def parse_rows(rows: list, headers: list) -> list:
 
     transactions = []
     skipped = []
+    dated_rows = 0
     for n, row in enumerate(rows):
         date_raw = row.get(date_col)
         if date_raw is None or (isinstance(date_raw, str) and not date_raw.strip()):
@@ -334,6 +337,7 @@ def parse_rows(rows: list, headers: list) -> list:
         if dt is None:
             skipped.append(f"row {n + 1}: unreadable date {date_raw!r}")
             continue
+        dated_rows += 1
         if time_col and not (dt.hour or dt.minute):
             t = parse_datetime(f"{dt:%d/%m/%Y} {cell_str(row.get(time_col))[:5]}")
             if t:
@@ -398,6 +402,22 @@ def parse_rows(rows: list, headers: list) -> list:
     if skipped:
         print(f"  [parse] WARNING: skipped {len(skipped)} row(s) that could not be "
               f"read: {skipped[:5]}")
+
+    # Every dated row came back zero money: the matched in/out/amount column(s)
+    # are very likely the wrong ones (e.g. a column that merely shares a name
+    # with a real bank's money column but holds something else here), not a
+    # statement that is genuinely empty. Say so plainly instead of silently
+    # handing back an empty list, which upstream only reports as a generic
+    # "no transactions found".
+    if not transactions and dated_rows:
+        money_cols = ', '.join(f"'{c}'" for c in (in_col, out_col, amt_col) if c)
+        raise ValueError(
+            f"Found {dated_rows} row(s) with a date, but none had a usable amount in "
+            f"the column(s) this file's Paid in / Paid out / Amount was matched to: "
+            f"{money_cols or '(none)'}. That column may be named something this "
+            f"program doesn't recognise as holding money, or may be empty on every "
+            f"row. Columns found in the file: {', '.join(str(h) for h in headers)}"
+        )
 
     # Ascending by date, keeping the file's own order within a day. Exports
     # that are newest-first are reversed first, so same-day rows aren't left

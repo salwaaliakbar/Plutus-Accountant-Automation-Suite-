@@ -367,3 +367,24 @@ def test_single_year_boundary_not_snapped_when_start_day_is_mid_month():
     pairs = [(date(2024, 3, 15) + __import__('datetime').timedelta(days=i), 'FY24') for i in range(0, 360, 3)]
     lab = YearLabeller(pairs)
     assert lab.boundary != (3, 1)
+
+
+# A literal empty-string cell in the template can come back as None after
+# openpyxl's save round trip, even on a row write_workbook never touches —
+# that must not be reported as "original rows modified".
+
+def test_empty_string_cells_are_not_flagged_as_modified(make_csv, tmp_path):
+    rows = raw_rows()
+    # a dedicated (if minimal) Analysis sheet, so a small formula-bearing RAW
+    # sheet isn't itself mistaken for the Analysis sheet (see _sheet_score)
+    tmpl = template(tmp_path, HEADERS, rows, analysis=[['Row Labels', 'FY24']])
+    wb = openpyxl.load_workbook(tmpl)
+    ws = wb['RAW']
+    for r in range(2, 14):
+        ws.cell(r, 8).value = ''        # Balance held as a literal '' in the template
+    wb.save(tmpl)
+
+    txns, _ = prepare_new_transactions(parse_csv(make_csv()), tmpl)
+    problems = write_workbook(txns, ['Purchase', 'Income', 'Petrol', 'Petrol', 'Parking'],
+                              tmpl, tmp_path / 'out.xlsx')
+    assert problems == []
