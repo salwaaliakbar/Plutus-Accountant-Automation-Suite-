@@ -84,6 +84,12 @@ MONZO_LIKE = [('No', 'no'), ('Transaction ID', 'txid'), ('Date', 'date'), ('Time
               ('Money In', 'in'), ('Money Out', 'out'), ('Balance', 'bal'),
               ('UC category', 'uc')]
 
+# A template whose only category-like column is named plainly 'Category' —
+# no 'UC' anywhere in the sheet.
+PLAIN_CATEGORY_LIKE = [('No', 'no'), ('Date', 'date'), ('Description', 'desc'),
+                       ('Paid in', 'in'), ('Paid Out', 'out'), ('Balance', 'bal'),
+                       ('Category', 'uc')]
+
 
 def test_column_roles_are_found_by_header_words_and_contents(tmp_path):
     ws = openpyxl.load_workbook(build_template(tmp_path, HOWAYDA_LIKE))['RAW']
@@ -170,3 +176,19 @@ def test_missing_category_column_is_reported(make_csv, tmp_path):
     cols = [c for c in HAROON_LIKE if c[1] not in ('uc',)]
     _, _, _, warnings = run(make_csv, build_template(tmp_path, cols), tmp_path)
     assert any('category column' in w for w in warnings)
+
+
+def test_plain_category_column_is_recognised_without_uc_in_the_name(make_csv, tmp_path):
+    # A column named just 'Category', with no 'UC' anywhere on the sheet,
+    # must still be found and written into — not reported as missing.
+    template = build_template(tmp_path, PLAIN_CATEGORY_LIKE)
+    rc = resolve_columns(openpyxl.load_workbook(template)['RAW'])
+    hdr_of = {c: PLAIN_CATEGORY_LIKE[c - 1][0] for c in range(1, len(PLAIN_CATEGORY_LIKE) + 1)}
+    assert hdr_of[rc['uc']] == 'Category'
+
+    ws, txns, problems, warnings = run(make_csv, template, tmp_path)
+    hdr = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
+    new_rows = range(42, 42 + len(txns))
+    assert [ws.cell(r, hdr['Category']).value for r in new_rows] == \
+        ['Purchase', 'Income', 'Petrol', 'Petrol', 'Parking']
+    assert not any('category column' in w for w in warnings)

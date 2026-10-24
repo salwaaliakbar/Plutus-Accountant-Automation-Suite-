@@ -7,7 +7,8 @@ import pytest
 
 from core import categorise as cat
 from core.columns import resolve_columns
-from core.excel_writer import prepare_new_transactions, write_workbook
+from core.excel_writer import (_capture_pivot_grids, _seed_relocated_pivot_grids,
+                               prepare_new_transactions, write_workbook)
 from parsers._common import salvage_json_array
 from parsers.parse_csv import parse_csv
 from parsers.parse_xls import parse_xls
@@ -388,3 +389,64 @@ def test_empty_string_cells_are_not_flagged_as_modified(make_csv, tmp_path):
     problems = write_workbook(txns, ['Purchase', 'Income', 'Petrol', 'Petrol', 'Parking'],
                               tmpl, tmp_path / 'out.xlsx')
     assert problems == []
+
+
+# A client's real template (a genuine native Excel PivotTable sharing a sheet
+# with the Analysis grid) showed the pivot's old spot overwritten by the
+# Analysis rebuild and its new, relocated spot sitting completely blank until
+# Excel refreshes it on open — which, to a non-technical user, looks exactly
+# like "the pivot table isn't working, it's just numbers". The pivot's last
+# cached grid must be carried over to its new spot instead of leaving a void.
+
+class _FakeLocation:
+    def __init__(self, ref):
+        self.ref = ref
+
+
+class _FakePivot:
+    def __init__(self, ref):
+        self.location = _FakeLocation(ref)
+
+
+def test_relocated_pivot_grid_is_seeded_instead_of_left_blank():
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Analysis'
+    ws['A1'], ws['B1'] = 'Row Labels', 'FY25'
+    ws['A2'], ws['B2'] = 'Food', -50.5
+    ws['A3'], ws['B3'] = 'Grand Total', -50.5
+    ws['B2'].number_format = '#,##0.00'
+
+    piv = _FakePivot('A1:B3')
+    ws._pivots = [piv]
+
+    # captured before the Analysis rebuild overwrites the pivot's own cells
+    grids = _capture_pivot_grids(ws)
+    for r in range(1, 4):
+        for c in range(1, 3):
+            ws.cell(r, c).value = None
+    ws['A1'] = 'Food'   # the SUMIFS grid now lives where the pivot used to be
+
+    # the pivot is relocated clear of the grid ...
+    piv.location.ref = 'E1:F3'
+    # ... and its last-known grid should reappear at the new spot
+    _seed_relocated_pivot_grids(ws, grids)
+
+    assert [ws['E1'].value, ws['F1'].value] == ['Row Labels', 'FY25']
+    assert [ws['E2'].value, ws['F2'].value] == ['Food', -50.5]
+    assert ws['F2'].number_format == '#,##0.00'
+    assert ws['E3'].value == 'Grand Total'
+    assert ws['E1'].comment is not None
+
+
+def test_pivot_already_clear_of_the_grid_is_left_untouched():
+    # idempotent: a pivot that was never relocated must not be re-seeded or
+    # commented on top of the client's own, already-correct cells
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws['A1'] = 'Row Labels'
+    piv = _FakePivot('A1:A1')
+    ws._pivots = [piv]
+    grids = _capture_pivot_grids(ws)
+    _seed_relocated_pivot_grids(ws, grids)   # ref unchanged -> no-op
+    assert ws['A1'].comment is None

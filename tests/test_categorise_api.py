@@ -131,6 +131,56 @@ def test_no_key_marks_everything_unknown_for_review(monkeypatch):
     assert cats == ['Unknown'] and review == [True]
 
 
+# ── a large statement's multi-batch run must never leave a cell blank ─────────
+# (client feedback: "for clients with a large number of transactions, a few
+# categories are left completely empty" — stress-tested here since no
+# reproduction file was available).
+
+def test_large_multi_batch_run_never_leaves_a_blank_category(fake_api):
+    calls = []
+
+    def answer(n, msg):
+        calls.append(n)
+        if len(calls) == 2:
+            # a well-formed reply, but with a null and an empty-string
+            # category mixed in — the kind of partial answer a model can
+            # give without the whole response being truncated/garbled.
+            items = [{'category': 'Sundry', 'sure': True}] * (n - 2)
+            items += [{'category': None, 'sure': False}, {'category': '', 'sure': False}]
+            return json.dumps(items)
+        return json.dumps([{'category': 'Sundry', 'sure': True}] * n)
+
+    fake_api(answer)
+    # distinct payees (not just a numeric suffix, which _payee_key strips as
+    # pure digits and would collapse them all into one payee)
+    txns = [txn(f'PAYEE {chr(65 + i % 26)}{chr(65 + i // 26)} LTD', out=1 + i)
+            for i in range(120)]                                 # 3 batches of 40
+    cats, review = cat.categorise_detailed(txns, batch_size=40)
+    assert len(cats) == len(txns) == len(review)
+    assert all(isinstance(c, str) and c.strip() for c in cats), \
+        f'a blank category reached the output: {[c for c in cats if not (c and c.strip())]}'
+    assert cats.count('Unknown') == 2    # the null and empty-string entries, safely defaulted
+
+
+def test_unparseable_batch_fails_loudly_rather_than_leaving_blanks(fake_api):
+    # A batch Claude's reply can't be parsed at all must fail the whole call,
+    # not silently leave that portion's cells blank in an otherwise-successful
+    # output — ruling this out as the cause of the "large statement" feedback.
+    calls = []
+
+    def answer(n, msg):
+        calls.append(n)
+        if len(calls) == 2:
+            return 'Sorry, I cannot help with that.'
+        return json.dumps([{'category': 'Sundry', 'sure': True}] * n)
+
+    fake_api(answer)
+    txns = [txn(f'PAYEE {chr(65 + i % 26)}{chr(65 + i // 26)} LTD', out=1 + i)
+            for i in range(120)]
+    with pytest.raises(ValueError):
+        cat.categorise_detailed(txns, batch_size=40)
+
+
 # ── live (real Claude call) ──────────────────────────────────────────────────
 
 @pytest.mark.live

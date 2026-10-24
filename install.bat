@@ -1,5 +1,5 @@
 @echo off
-REM ── Plutus Accountant Automation Suite installer ─────────────────────────
+REM ---- Plutus Accountant Automation Suite installer ----------------------
 REM One-time setup: Python environment, Python packages, web interface
 REM packages and the .env file. Safe to run again (e.g. after an update).
 cd /d "%~dp0"

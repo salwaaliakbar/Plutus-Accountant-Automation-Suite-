@@ -178,6 +178,16 @@ def resolve_columns(ws, last_row: int = None) -> dict:
                  and _tokens(h) & {'category', 'cat', 'desc', 'description', 'class'}]
         if cands:
             cols['uc'] = claim(cands[-1][0])
+    # No 'uc'-worded column anywhere: a plain 'Category' (no bank/spending/
+    # statement qualifier, so it isn't the bank's own import category) is
+    # where the client wants the AI's answer written.
+    if not cols['uc']:
+        cands = [(c, h) for h, c in ordered
+                 if c not in taken
+                 and _tokens(h) & {'category', 'cat', 'class'}
+                 and not _tokens(h) & {'balance', 'check', 'bal', 'bank', 'spending', 'statement'}]
+        if cands:
+            cols['uc'] = claim(cands[-1][0])
     if not cols['bank_cat']:
         cands = [(c, h) for h, c in ordered
                  if c not in taken and 'categor' in h

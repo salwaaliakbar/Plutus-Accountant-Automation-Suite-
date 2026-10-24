@@ -110,6 +110,11 @@ REVIEW_FILL = PatternFill('solid', start_color='FFFF00', end_color='FFFF00')
 REVIEW_NOTE = ('Please check: the AI was not sure about this category. If it is '
                f"wrong, type the right one in the '{CORRECTION_HEADER}' column.")
 
+PIVOT_MOVED_NOTE = ("This is your PivotTable — moved here, clear of the summary grid "
+                    "on the left, so updating one never overwrites the other. It shows "
+                    "the figures as of the last update; open it in Excel and it "
+                    "refreshes automatically to include the new rows.")
+
 
 def _col(hdrs: dict, *names: str):
     for n in names:
@@ -174,6 +179,62 @@ def _relocate_pivot_clear_of_grid(ws_a, grid_last_col: int) -> None:
         loc.ref = (f'{get_column_letter(start_col + delta)}{r1}:'
                    f'{get_column_letter(end_col + delta)}{r2}')
         _repoint_getpivotdata(ws_a, c1, r1, get_column_letter(start_col + delta))
+
+
+def _capture_pivot_grids(ws_a) -> dict:
+    """Snapshot each PivotTable's displayed grid (value + number format) at
+    its current location, before the Analysis rebuild overwrites those same
+    cells with SUMIFS formulas. Used to re-seed the pivot's new spot once it
+    is relocated, so the sheet never shows a blank void where a table used
+    to be — a client who doesn't manually refresh/scroll to it would
+    otherwise see nothing there until they do."""
+    grids = {}
+    for piv in getattr(ws_a, '_pivots', []):
+        m = _REF_RE.match(piv.location.ref or '')
+        if not m:
+            continue
+        c1, r1, c2, r2 = m.groups()
+        c1i, c2i = column_index_from_string(c1), column_index_from_string(c2)
+        r1i, r2i = int(r1), int(r2)
+        cells = {}
+        for r in range(r1i, r2i + 1):
+            for c in range(c1i, c2i + 1):
+                cell = ws_a.cell(r, c)
+                cells[(r - r1i, c - c1i)] = (cell.value, cell.number_format)
+        grids[id(piv)] = (piv.location.ref, cells)
+    return grids
+
+
+def _seed_relocated_pivot_grids(ws_a, grids: dict) -> None:
+    """After relocation, fill a PivotTable's new cells with the grid
+    captured before the move (see _capture_pivot_grids), so it reads as a
+    real table immediately — Excel's own refresh-on-open then replaces
+    this snapshot with live, interactive values."""
+    for piv in getattr(ws_a, '_pivots', []):
+        cached = grids.get(id(piv))
+        if not cached:
+            continue
+        old_ref, cells = cached
+        new_ref = piv.location.ref
+        if new_ref == old_ref:
+            continue
+        m = _REF_RE.match(new_ref or '')
+        if not m:
+            continue
+        base_col, base_row = column_index_from_string(m.group(1)), int(m.group(2))
+        for (dr, dc), (value, fmt) in cells.items():
+            try:
+                cell = ws_a.cell(base_row + dr, base_col + dc)
+                if cell.value in (None, ''):
+                    cell.value = value
+                    if fmt:
+                        cell.number_format = fmt
+            except AttributeError:
+                continue    # a merged, non-anchor cell — not writable, skip it
+        try:
+            ws_a.cell(base_row, base_col).comment = Comment(PIVOT_MOVED_NOTE, 'Plutus')
+        except AttributeError:
+            pass
 
 
 def _repoint_getpivotdata(ws_a, old_col: str, row: str, new_col: str) -> None:
@@ -892,7 +953,7 @@ def write_workbook(
         w(bal_col,  balance)
         w(csv_cat_col, in_clients_spelling(csv_cat_col, (txn.get('csv_category') or '').strip()
                                            or learned_spending(desc, cat)))
-        w(uc_col,   cat)
+        w(uc_col,   cat or 'Unknown')
         # reviewed_cols ('MUC desc') are deliberately left empty: that is the
         # reviewer's column, and the AI is the first pass
         if uc_col and review and i < len(review) and review[i]:
@@ -1003,6 +1064,7 @@ def write_workbook(
         # alone — the pivot's own refresh-on-open brings in the new rows,
         # and nothing of the accountant's own working is at risk.
         snapshot = _snapshot_sheet(ws_a)
+        pivot_grids = _capture_pivot_grids(ws_a)
         try:
             _update_analysis(ws_a, ws, pivot_year_col, net_source_col,
                              analysis_cat_col, last_data_row=new_last)
@@ -1024,6 +1086,7 @@ def write_workbook(
                         grid_last_col = max(grid_last_col, c)
                         c += 1
                 _relocate_pivot_clear_of_grid(ws_a, grid_last_col)
+                _seed_relocated_pivot_grids(ws_a, pivot_grids)
         except Exception as exc:
             _restore_sheet(ws_a, snapshot)
             print(f"  [excel_writer] Analysis update failed ({exc}); {analysis_name} "
@@ -1083,7 +1146,8 @@ def _collect_warnings(ws, hdrs, model_formulas, last_row, new_last, uc_col,
         return
     if not uc_col:
         warnings.append("No category column was recognised in the template, so the "
-                        "categories could not be written. Name it e.g. 'UC category'.")
+                        "categories could not be written. Name it 'Category' or "
+                        "'UC category'.")
     n_new = new_last - last_row
     sample = range(max(2, last_row - 29), last_row + 1)
     if n_new <= 0 or len(sample) < 5:        # nothing to compare against yet
