@@ -1,5 +1,5 @@
 @echo off
-REM ── Plutus web interface only (port 5173) ────────────────────────────────
+REM ---- Plutus web interface only (port 5173) -------------------------------
 REM Close this window (or press Ctrl+C) to stop it.
 cd /d "%~dp0"
 title Plutus - Web UI

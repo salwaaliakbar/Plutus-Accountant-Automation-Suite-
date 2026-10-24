@@ -1,5 +1,5 @@
 @echo off
-REM ── Plutus backend engine only (port 8000) ───────────────────────────────
+REM ---- Plutus backend engine only (port 8000) ------------------------------
 REM Close this window (or press Ctrl+C) to stop it. Run again to restart
 REM after a code update.
 cd /d "%~dp0"

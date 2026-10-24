@@ -1,5 +1,5 @@
 @echo off
-REM ── Plutus Accountant Automation Suite launcher ──────────────────────────
+REM ---- Plutus Accountant Automation Suite launcher ------------------------
 REM Starts the backend engine and the web interface, then opens the browser.
 cd /d "%~dp0"
 
