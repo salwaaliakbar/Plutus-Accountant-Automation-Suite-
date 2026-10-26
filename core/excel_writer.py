@@ -846,6 +846,21 @@ def write_workbook(
         top = max(votes, key=votes.get)
         return top if votes[top] >= 2 and votes[top] / sum(votes.values()) >= 0.6 else None
 
+    # A passthrough column every historical row agrees on, regardless of
+    # payee, is an account-level fact rather than a per-transaction one —
+    # e.g. 'Account Name' / 'Account Number', the same on every row of the
+    # statement. Carried forward even for a payee that never appeared
+    # before, which learned_value() (payee-specific) cannot do.
+    constant_value = {}
+    if last_row > 1:
+        for c in history_cols:
+            vals = [str(ws.cell(r_scan, c).value).strip() for r_scan in range(2, last_row + 1)
+                    if isinstance(ws.cell(r_scan, c).value, str)
+                    and ws.cell(r_scan, c).value.strip()
+                    and not ws.cell(r_scan, c).value.startswith('=')]
+            if len(vals) >= max(10, 0.5 * (last_row - 1)) and len(set(vals)) == 1:
+                constant_value[c] = vals[0]
+
     # The same payment type is spelled differently by each source: the CSV
     # says 'Faster payment', the PDF 'Faster Payments'; Starling prints
     # 'DIRECT DEBIT' where a PDF gives 'Direct Debit'; Monzo's CSV has
@@ -970,8 +985,15 @@ def write_workbook(
             if col and ws.cell(r, col).value is None:
                 w(col, passthrough_value(col, v))
         for col in passthrough.values():          # not in the statement: ask history
-            if col in hist and ws.cell(r, col).value is None:
-                w(col, learned_value(col, desc))
+            if ws.cell(r, col).value is not None:
+                continue
+            if col in hist:
+                v = learned_value(col, desc)
+                if v is not None:
+                    w(col, v)
+                    continue
+            if col in constant_value:
+                w(col, constant_value[col])
 
         # signed amount column
         if amt_col and amt_col not in model_formulas:
